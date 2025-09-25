@@ -1,5 +1,7 @@
 import os
 import numpy as np
+from typing import Dict, List
+from pathlib import Path
 from torch.utils.data import Dataset
 from PIL import Image
 from utils.graphics_utils import focal2fov
@@ -29,29 +31,35 @@ class multipleview_dataset(Dataset):
         
     
     def load_images_path(self, cam_folder, cam_extrinsics,cam_intrinsics,split):
-        image_length = len(os.listdir(os.path.join(cam_folder,"cam01")))
-        #len_cam=len(cam_extrinsics)
         image_paths=[]
         image_poses=[]
         image_times=[]
-        for idx, key in enumerate(cam_extrinsics):
-            extr = cam_extrinsics[key]
-            R = np.transpose(qvec2rotmat(extr.qvec))
-            T = np.array(extr.tvec)
+        cam_root = Path(cam_folder)
+        grouped: Dict[str, List] = {}
+        for extr in cam_extrinsics.values():
+            cam_name = str(Path(extr.name).parent)
+            grouped.setdefault(cam_name, []).append(extr)
 
-            number = os.path.basename(extr.name)[5:-4]
-            images_folder=os.path.join(cam_folder,"cam"+number.zfill(2))
+        for cam_name in sorted(grouped.keys()):
+            extr_list = grouped[cam_name]
+            extr_list.sort(key=lambda e: Path(e.name).stem)
+            image_length = len(extr_list)
+            if image_length == 0:
+                continue
 
-            image_range=range(image_length)
-            if split=="test":
-                image_range = [image_range[0],image_range[int(image_length/3)],image_range[int(image_length*2/3)]]
+            if split == "test":
+                indices = sorted({0, image_length // 3, (2 * image_length) // 3})
+            else:
+                indices = range(image_length)
 
-            for i in image_range:    
-                num=i+1
-                image_path=os.path.join(images_folder,"frame_"+str(num).zfill(5)+".jpg")
-                image_paths.append(image_path)
-                image_poses.append((R,T))
-                image_times.append(float(i/image_length))
+            for idx in indices:
+                extr = extr_list[idx]
+                R = np.transpose(qvec2rotmat(extr.qvec))
+                T = np.array(extr.tvec)
+                image_path = cam_root / extr.name
+                image_paths.append(str(image_path))
+                image_poses.append((R, T))
+                image_times.append(float(idx / max(image_length - 1, 1)))
 
         return image_paths, image_poses,image_times
     

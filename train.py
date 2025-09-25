@@ -14,7 +14,7 @@ import os, sys
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -23,6 +23,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
+from utils.params_utils import merge_hparams, load_config
 from torch.utils.data import DataLoader
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
@@ -44,6 +45,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     first_iter = 0
 
     gaussians.training_setup(opt)
+    print(f"[{stage}] Initial gaussian count: {gaussians.get_xyz.shape[0]}")
     if checkpoint:
         # breakpoint()
         if stage == "coarse" and stage not in checkpoint:
@@ -106,33 +108,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                             # 
     count = 0
     for iteration in range(first_iter, final_iter+1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    count +=1
-                    viewpoint_index = (count ) % len(video_cams)
-                    if (count //(len(video_cams))) % 2 == 0:
-                        viewpoint_index = viewpoint_index
-                    else:
-                        viewpoint_index = len(video_cams) - viewpoint_index - 1
-                    # print(viewpoint_index)
-                    viewpoint = video_cams[viewpoint_index]
-                    custom_cam.time = viewpoint.time
-                    # print(custom_cam.time, viewpoint_index, count)
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
-
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
-                    break
-            except Exception as e:
-                print(e)
-                network_gui.conn = None
-
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -235,6 +210,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                                           "psnr": f"{psnr_:.{2}f}",
                                           "point":f"{total_point}"})
                 progress_bar.update(10)
+            if iteration % 500 == 0 or iteration == first_iter:
+                opacity_stats = gaussians.get_opacity
+                print(
+                    f"[{stage}] Iteration {iteration}: {gaussians.get_xyz.shape[0]} gaussians, "
+                    f"opacity mean={opacity_stats.mean().item():.4f}, "
+                    f"min={opacity_stats.min().item():.4f}, max={opacity_stats.max().item():.4f}"
+                )
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -414,9 +396,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.configs:
-        import mmcv
-        from utils.params_utils import merge_hparams
-        config = mmcv.Config.fromfile(args.configs)
+        config = load_config(args.configs)
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
 
@@ -424,7 +404,6 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname)
 
