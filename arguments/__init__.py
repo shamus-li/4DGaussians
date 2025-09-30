@@ -152,6 +152,8 @@ class OptimizationParams(ParamGroup):
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
+    cfg_loaded = False
+    default_args = parser.parse_args([])
     args_cmdline = parser.parse_args(cmdlne_string)
 
     try:
@@ -160,13 +162,17 @@ def get_combined_args(parser : ArgumentParser):
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
+            cfg_loaded = True
     except TypeError:
         print("Config file not found at")
         pass
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+    default_dict = vars(default_args)
+    for k, v in vars(args_cmdline).items():
+        default_v = default_dict.get(k, object())
+        if k not in merged_dict or v != default_v:
             merged_dict[k] = v
+    merged_dict["cfg_file_loaded"] = cfg_loaded
     return Namespace(**merged_dict)

@@ -1,9 +1,15 @@
 def merge_hparams(args, config):
     params = ["OptimizationParams", "ModelHiddenParams", "ModelParams", "PipelineParams"]
+    prefer_existing = getattr(args, "cfg_file_loaded", False)
     for param in params:
         if param in config.keys():
             for key, value in config[param].items():
                 if hasattr(args, key):
+                    current = getattr(args, key)
+                    if prefer_existing and current is not None:
+                        continue
+                    setattr(args, key, value)
+                else:
                     setattr(args, key, value)
 
     return args

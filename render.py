@@ -57,7 +57,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if idx == 0:time1 = time()
         
-        rendering = render(view, gaussians, pipeline, background,cam_type=cam_type)["render"]
+        render_pkg = render(view, gaussians, pipeline, background, cam_type=cam_type)
+        rendering = render_pkg["render"]
+        if idx == 0:
+            print(
+                f"Render stats -> min: {rendering.min().item():.4f}, max: {rendering.max().item():.4f}, mean: {rendering.mean().item():.4f}"
+            )
         render_images.append(to8b(rendering).transpose(1,2,0))
         render_list.append(rendering)
         if name in ["train", "test"]:

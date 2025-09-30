@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 from utils.graphics_utils import focal2fov
 from scene.colmap_loader import qvec2rotmat
-from scene.dataset_readers import CameraInfo
+from scene.dataset_readers import CameraInfo, fetchPly
 from scene.neural_3D_dataset_NDC import get_spiral
 from torchvision import transforms as T
 
@@ -73,25 +73,74 @@ class multipleview_dataset(Dataset):
 
         cameras = []
         len_poses = len(val_poses)
-        times = [i/len_poses for i in range(len_poses)]
+        times = [i / len_poses for i in range(len_poses)]
         image = Image.open(self.image_paths[0])
         image = self.transform(image)
+
+        ply_path = os.path.join(datadir, "points3D_multipleview.ply")
+        if os.path.exists(ply_path):
+            pcd = fetchPly(ply_path)
+            target = np.asarray(pcd.points).mean(axis=0)
+        else:
+            target = np.zeros(3, dtype=np.float32)
+        self.mean_center = target
+        up_hint = val_poses[:, :3, 1].mean(axis=0)
+        if np.linalg.norm(up_hint) < 1e-6:
+            up_hint = np.array([0.0, 1.0, 0.0])
 
         for idx, p in enumerate(val_poses):
             image_path = None
             image_name = f"{idx}"
             time = times[idx]
+
             pose = np.eye(4)
-            pose[:3,:] = p[:3,:]
-            R = pose[:3,:3]
-            R = - R
-            R[:,0] = -R[:,0]
-            T = -pose[:3,3].dot(R)
+            pose[:3, :4] = p[:3, :4]
+
+            C = pose[:3, 3]
+
+            forward = target - C
+            forward_norm = np.linalg.norm(forward)
+            if forward_norm < 1e-6:
+                forward = pose[:3, 2]
+                forward_norm = np.linalg.norm(forward)
+            forward = forward / forward_norm
+
+            right = np.cross(forward, up_hint)
+            right_norm = np.linalg.norm(right)
+            if right_norm < 1e-6:
+                # fall back to an orthogonal axis if the hint is collinear
+                fallback = np.array([0.0, 0.0, 1.0])
+                if abs(np.dot(forward, fallback)) > 0.99:
+                    fallback = np.array([0.0, 1.0, 0.0])
+                right = np.cross(forward, fallback)
+                right_norm = np.linalg.norm(right)
+            right = right / right_norm
+
+            true_up = np.cross(right, forward)
+            true_up = true_up / np.linalg.norm(true_up)
+
+            R_c2w = np.stack([-right, true_up, forward], axis=1)
+            T = -R_c2w.transpose() @ C
+
             FovX = self.FovX
             FovY = self.FovY
-            cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                                time = time, mask=None))
+
+            cameras.append(
+                CameraInfo(
+                    uid=idx,
+                    R=R_c2w,
+                    T=T,
+                    FovY=FovY,
+                    FovX=FovX,
+                    image=image,
+                    image_path=image_path,
+                    image_name=image_name,
+                    width=image.shape[2],
+                    height=image.shape[1],
+                    time=time,
+                    mask=None,
+                )
+            )
         return cameras
     def __len__(self):
         return len(self.image_paths)

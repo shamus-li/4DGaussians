@@ -8,18 +8,20 @@ while using the ground-truth Blender camera poses for all COLMAP artifacts.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
-import ctypes
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
+from plyfile import PlyData, PlyElement
 
 
 def ensure_cudss_accessible() -> None:
@@ -27,9 +29,7 @@ def ensure_cudss_accessible() -> None:
     if not prefix:
         return
 
-    cudss_dirs = sorted(
-        Path(prefix).glob("opt/libcudss-linux-x86_64-*_cuda12-archive")
-    )
+    cudss_dirs = sorted(Path(prefix).glob("opt/libcudss-linux-x86_64-*_cuda12-archive"))
     if not cudss_dirs:
         return
 
@@ -66,14 +66,6 @@ def ensure_cudss_accessible() -> None:
 
 
 ensure_cudss_accessible()
-
-try:  # Users may skip VGGT / reconstruction in dry runs
-    import pycolmap  # type: ignore
-except ImportError:  # pragma: no cover - handled at runtime
-    pycolmap = None  # type: ignore
-
-from PIL import Image
-from plyfile import PlyData, PlyElement
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
@@ -417,79 +409,18 @@ def create_reconstruction(
     colors: np.ndarray,
 ) -> None:
     sparse_dir.mkdir(parents=True, exist_ok=True)
-    use_pycolmap = False
-    cam_attr = None
-    if pycolmap is not None:
-        cam_attr = getattr(pycolmap.Image, "cam_from_world", None)
-        setter = getattr(cam_attr, "fset", None) if cam_attr is not None else None
-        use_pycolmap = setter is not None
-
-    if use_pycolmap:
-        reconstruction = pycolmap.Reconstruction()
-
-        cameras: Dict[str, pycolmap.Camera] = {}
-        for frame in frames:
-            if frame.camera_name in cameras:
-                continue
-            width, height = frame.width, frame.height
-            if "fl_x" in transforms and "fl_y" in transforms:
-                fx = float(transforms["fl_x"])
-                fy = float(transforms["fl_y"])
-                cx = float(transforms.get("cx", width / 2))
-                cy = float(transforms.get("cy", height / 2))
-                camera = pycolmap.Camera(
-                    model="PINHOLE",
-                    width=width,
-                    height=height,
-                    params=[fx, fy, cx, cy],
-                    camera_id=len(cameras) + 1,
-                )
-            else:
-                if "camera_angle_x" not in transforms:
-                    raise ValueError(
-                        "Unable to determine focal length from transforms.json"
-                    )
-                fx = width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
-                cx = width / 2
-                cy = height / 2
-                camera = pycolmap.Camera(
-                    model="SIMPLE_PINHOLE",
-                    width=width,
-                    height=height,
-                    params=[fx, cx, cy],
-                    camera_id=len(cameras) + 1,
-                )
-            reconstruction.add_camera(camera)
-            cameras[frame.camera_name] = camera
-
-        for image_id, frame in enumerate(frames, start=1):
-            c2w = blender_matrix_to_opencv_c2w(frame.transform_matrix)
-            w2c = np.linalg.inv(c2w)
-            R_wc = w2c[:3, :3]
-            t_wc = w2c[:3, 3]
-            image = pycolmap.Image()
-            image.image_id = image_id
-            image.name = str(Path(frame.camera_name) / frame.dst_path.name)
-            image.camera_id = cameras[frame.camera_name].camera_id
-            cam_from_world = pycolmap.Rigid3d(np.hstack([R_wc, t_wc.reshape(3, 1)]))
-            image.cam_from_world = cam_from_world
-            image.registered = True
-            reconstruction.add_image(image)
-
-        if points.size > 0:
-            sample_count = min(len(points), 5000)
-            sample_idx = np.linspace(0, len(points) - 1, sample_count).astype(np.int64)
-            for idx in sample_idx:
-                reconstruction.add_point3D(points[idx], pycolmap.Track(), colors[idx])
-
-        reconstruction.write(sparse_dir)
-        return
 
     try:
-        from colmap_converter import (
+        from scripts.colmap_converter import (
             Camera as ColmapCamera,
+        )
+        from scripts.colmap_converter import (
             Image as ColmapImage,
+        )
+        from scripts.colmap_converter import (
             Point3D as ColmapPoint3D,
+        )
+        from scripts.colmap_converter import (
             write_cameras_binary,
             write_cameras_text,
             write_images_binary,
@@ -499,8 +430,7 @@ def create_reconstruction(
         )
     except ImportError as exc:  # pragma: no cover - defensive
         raise ImportError(
-            "colmap_converter.py is required to export COLMAP artifacts when pycolmap "
-            "does not expose pose setters"
+            "colmap_converter.py is required to export COLMAP artifacts"
         ) from exc
 
     camera_id_map: Dict[str, int] = {}
@@ -518,7 +448,9 @@ def create_reconstruction(
             params = np.array([fx, fy, cx, cy], dtype=np.float64)
         else:
             if "camera_angle_x" not in transforms:
-                raise ValueError("Unable to determine focal length from transforms.json")
+                raise ValueError(
+                    "Unable to determine focal length from transforms.json"
+                )
             fx = width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
             cx = width / 2
             cy = height / 2
@@ -596,10 +528,10 @@ def compute_poses_bounds_from_frames(
 
         if "fl_x" in transforms and "fl_y" in transforms:
             fx = float(transforms["fl_x"])
-            fy = float(transforms["fl_y"])
+            # fy = float(transforms["fl_y"])
         else:
             fx = frame.width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
-            fy = fx
+            # fy = fx
 
         pose[:, 4] = np.array([frame.height, frame.width, fx], dtype=np.float32)
 
@@ -665,16 +597,25 @@ def parse_args() -> argparse.Namespace:
         description="Convert Blender multi-cam renders to 4DGaussians multi-view format",
     )
     parser.add_argument(
-        "--blender_dir", required=True, help="Directory containing Blender outputs"
+        "--blender",
+        required=True,
+        type=Path,
+        help="Directory containing Blender outputs",
     )
-    parser.add_argument("--output_dir", required=True, help="Target dataset directory")
     parser.add_argument(
-        "--dataset_name", help="Optional dataset name for config generation"
+        "--output",
+        required=True,
+        type=Path,
+        help="Target dataset directory",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        help="Optional dataset name for config generation (defaults to output directory name)",
     )
     parser.add_argument(
         "--vggt_script",
         type=Path,
-        default=None,
+        default=Path("~/repos/vggt/demo_colmap.py").expanduser(),
         help="Path to VGGT demo_colmap.py (required unless --skip_vggt is set)",
     )
     parser.add_argument(
@@ -705,9 +646,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    blender_dir = Path(args.blender_dir).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    blender_dir = args.blender.expanduser().resolve()
+    output_dir = args.output.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_name = args.dataset_name or output_dir.name
 
     transforms_path = blender_dir / "transforms.json"
     if not transforms_path.exists():
@@ -725,7 +668,10 @@ def main() -> int:
     point_cloud_path = output_dir / "points3D_multipleview.ply"
 
     if not args.skip_vggt:
-        if args.vggt_script is None:
+        vggt_script_path = (
+            args.vggt_script.expanduser() if args.vggt_script is not None else None
+        )
+        if vggt_script_path is None:
             raise ValueError("--vggt_script must be specified when VGGT is enabled")
 
         tmp_scene_dir = output_dir / "tmp_colmap"
@@ -735,7 +681,7 @@ def main() -> int:
         )
         if conda_env == "":
             conda_env = None
-        run_vggt_demo(args.vggt_script, tmp_scene_dir, conda_env)
+        run_vggt_demo(vggt_script_path, tmp_scene_dir, conda_env)
 
         vggt_points, vggt_colors, pose_by_name = load_vggt_outputs(tmp_scene_dir)
 
@@ -790,7 +736,6 @@ def main() -> int:
         output_dir / "poses_bounds_multipleview.npy",
     )
 
-    dataset_name = args.dataset_name or output_dir.name
     create_config_file(output_dir, dataset_name)
 
     print("Conversion complete. Dataset ready at:", output_dir)
@@ -799,7 +744,7 @@ def main() -> int:
     print(
         "  python train.py -s",
         output_dir,
-        f'--port 6017 --expname "multipleview/{dataset_name}" --configs arguments/multipleview/{dataset_name}.py',
+        f'--expname "multipleview/{dataset_name}" --configs arguments/multipleview/{dataset_name}.py',
     )
 
     return 0
