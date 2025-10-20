@@ -106,7 +106,7 @@ def scene_reconstruction(
                 viewpoint_stack,
                 batch_size=batch_size,
                 sampler=sampler,
-                num_workers=16,
+                num_workers=0,
                 collate_fn=list,
             )
             random_loader = False
@@ -115,7 +115,7 @@ def scene_reconstruction(
                 viewpoint_stack,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=16,
+                num_workers=0,
                 collate_fn=list,
             )
             random_loader = True
@@ -153,7 +153,7 @@ def scene_reconstruction(
                         viewpoint_stack,
                         batch_size=opt.batch_size,
                         shuffle=True,
-                        num_workers=32,
+                        num_workers=0,
                         collate_fn=list,
                     )
                     random_loader = True
@@ -674,6 +674,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+
+    # Auto-detect config.py in source directory if --configs not provided
+    if not args.configs:
+        from pathlib import Path
+        auto_config = Path(args.source_path) / "config.py"
+        if auto_config.exists():
+            args.configs = str(auto_config)
+            print(f"Auto-detected config at: {args.configs}")
+
     if args.configs:
         config = load_config(args.configs)
         args = merge_hparams(args, config)

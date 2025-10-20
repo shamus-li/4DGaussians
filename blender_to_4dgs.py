@@ -89,6 +89,10 @@ class FrameRecord:
     transform_matrix: np.ndarray
     width: int
     height: int
+    fl_x: float
+    fl_y: float
+    cx: float
+    cy: float
     tmp_basename: str | None = None
 
 
@@ -169,7 +173,7 @@ def convert_image_to_jpeg(src: Path, dst: Path) -> Tuple[int, int]:
 
 
 def copy_frames_to_dataset(
-    blender_dir: Path, output_dir: Path, transforms: Dict
+    blender_dir: Path, output_dir: Path, transforms: Dict, camera_id_offset: int = 0
 ) -> Dict[str, Dict]:
     frames = transforms.get("frames", [])
     if not frames:
@@ -182,7 +186,7 @@ def copy_frames_to_dataset(
 
     metadata: Dict[str, Dict] = {}
     for cam_idx, cam_name in enumerate(sorted(grouped.keys())):
-        canonical_cam = f"cam_{cam_idx + 1:05d}"
+        canonical_cam = f"cam_{camera_id_offset + cam_idx + 1:05d}"
         cam_dir = output_dir / canonical_cam
         cam_dir.mkdir(parents=True, exist_ok=True)
 
@@ -195,6 +199,33 @@ def copy_frames_to_dataset(
             src_path = resolve_source_image(blender_dir, frame["file_path"])
             dst_path = cam_dir / f"frame_{seq_idx + 1:05d}.jpg"
             width, height = convert_image_to_jpeg(src_path, dst_path)
+
+            # Extract per-frame focal lengths, fallback to global transforms
+            if "fl_x" in frame and "fl_y" in frame:
+                fl_x = float(frame["fl_x"])
+                fl_y = float(frame["fl_y"])
+                cx = float(frame.get("cx", width / 2))
+                cy = float(frame.get("cy", height / 2))
+            elif "fl_x" in transforms and "fl_y" in transforms:
+                fl_x = float(transforms["fl_x"])
+                fl_y = float(transforms["fl_y"])
+                cx = float(transforms.get("cx", width / 2))
+                cy = float(transforms.get("cy", height / 2))
+            elif "camera_angle_x" in frame:
+                fl_x = width / (2 * math.tan(float(frame["camera_angle_x"]) / 2))
+                fl_y = fl_x
+                cx = width / 2
+                cy = height / 2
+            elif "camera_angle_x" in transforms:
+                fl_x = width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
+                fl_y = fl_x
+                cx = width / 2
+                cy = height / 2
+            else:
+                raise ValueError(
+                    f"Unable to determine focal length for frame {frame['file_path']}"
+                )
+
             frame_records.append(
                 FrameRecord(
                     camera_name=canonical_cam,
@@ -206,6 +237,10 @@ def copy_frames_to_dataset(
                     ),
                     width=width,
                     height=height,
+                    fl_x=fl_x,
+                    fl_y=fl_y,
+                    cx=cx,
+                    cy=cy,
                 )
             )
 
@@ -249,7 +284,12 @@ def prepare_vggt_scene(frames: Iterable[FrameRecord], scene_dir: Path) -> None:
         frame.tmp_basename = basename
 
 
-def run_vggt_demo(demo_script: Path, scene_dir: Path, conda_env: Optional[str]) -> None:
+def run_vggt_demo(
+    demo_script: Path,
+    scene_dir: Path,
+    conda_env: Optional[str],
+    conf_threshold: float = 1.0,
+) -> None:
     if not demo_script.exists():
         raise FileNotFoundError(f"VGGT script not found at {demo_script}")
 
@@ -265,6 +305,8 @@ def run_vggt_demo(demo_script: Path, scene_dir: Path, conda_env: Optional[str]) 
             str(scene_dir),
             "--stage",
             "vggt",
+            "--conf_thres_value",
+            str(conf_threshold),
         ]
     else:
         cmd = [
@@ -274,6 +316,8 @@ def run_vggt_demo(demo_script: Path, scene_dir: Path, conda_env: Optional[str]) 
             str(scene_dir),
             "--stage",
             "vggt",
+            "--conf_thres_value",
+            str(conf_threshold),
         ]
     print("->", " ".join(cmd))
     result = subprocess.run(cmd, cwd=demo_script.parent, check=False)
@@ -439,21 +483,18 @@ def create_reconstruction(
         if frame.camera_name in camera_id_map:
             continue
         width, height = frame.width, frame.height
-        if "fl_x" in transforms and "fl_y" in transforms:
-            fx = float(transforms["fl_x"])
-            fy = float(transforms["fl_y"])
-            cx = float(transforms.get("cx", width / 2))
-            cy = float(transforms.get("cy", height / 2))
+
+        # Use per-frame focal lengths from FrameRecord
+        fx = frame.fl_x
+        fy = frame.fl_y
+        cx = frame.cx
+        cy = frame.cy
+
+        # Use PINHOLE if fx != fy, otherwise SIMPLE_PINHOLE
+        if abs(fx - fy) > 1e-6:
             model = "PINHOLE"
             params = np.array([fx, fy, cx, cy], dtype=np.float64)
         else:
-            if "camera_angle_x" not in transforms:
-                raise ValueError(
-                    "Unable to determine focal length from transforms.json"
-                )
-            fx = width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
-            cx = width / 2
-            cy = height / 2
             model = "SIMPLE_PINHOLE"
             params = np.array([fx, cx, cy], dtype=np.float64)
 
@@ -526,12 +567,8 @@ def compute_poses_bounds_from_frames(
         pose[:, :3] = c2w[:3, :3]
         pose[:, 3] = c2w[:3, 3]
 
-        if "fl_x" in transforms and "fl_y" in transforms:
-            fx = float(transforms["fl_x"])
-            # fy = float(transforms["fl_y"])
-        else:
-            fx = frame.width / (2 * math.tan(float(transforms["camera_angle_x"]) / 2))
-            # fy = fx
+        # Use per-frame focal length from FrameRecord
+        fx = frame.fl_x
 
         pose[:, 4] = np.array([frame.height, frame.width, fx], dtype=np.float32)
 
@@ -551,9 +588,7 @@ def compute_poses_bounds_from_frames(
 
 
 def create_config_file(output_dir: Path, dataset_name: str) -> None:
-    config_dir = REPO_ROOT / "arguments" / "multipleview"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / f"{dataset_name}.py"
+    config_path = output_dir / "config.py"
 
     content = """ModelHiddenParams = dict(
     kplanes_config = {
@@ -572,7 +607,7 @@ def create_config_file(output_dir: Path, dataset_name: str) -> None:
     no_dshs = False,
     no_ds = False,
     empty_voxel = False,
-    render_process = False,
+    render_process = True,
     static_mlp = False,
 )
 
@@ -613,6 +648,31 @@ def parse_args() -> argparse.Namespace:
         help="Optional dataset name for config generation (defaults to output directory name)",
     )
     parser.add_argument(
+        "--test_blender",
+        type=Path,
+        default=Path(
+            "/share/monakhova/shamus_data/multiplexed_pixels/dnerf/lego"
+        ).expanduser(),
+        help="Directory containing test dataset Blender outputs (default: /share/monakhova/shamus_data/multiplexed_pixels/dnerf/lego)",
+    )
+    parser.add_argument(
+        "--test_transforms",
+        type=str,
+        default="transforms_val.json",
+        help="Name of transforms file for test dataset (default: transforms_val.json)",
+    )
+    parser.add_argument(
+        "--video_blender",
+        type=Path,
+        help="Directory containing video dataset Blender outputs (defaults to same as --test_blender)",
+    )
+    parser.add_argument(
+        "--video_transforms",
+        type=str,
+        default="transforms_val.json",
+        help="Name of transforms file for video dataset (default: transforms_val.json)",
+    )
+    parser.add_argument(
         "--vggt_script",
         type=Path,
         default=Path("~/repos/vggt/demo_colmap.py").expanduser(),
@@ -640,6 +700,12 @@ def parse_args() -> argparse.Namespace:
         default="transformers",
         help="Conda environment name to run VGGT (use '' to run in current environment)",
     )
+    parser.add_argument(
+        "--vggt_conf_threshold",
+        type=float,
+        default=3.0,
+        help="Confidence threshold for VGGT point cloud generation (default: 1.0, VGGT default: 5.0)",
+    )
     return parser.parse_args()
 
 
@@ -652,6 +718,7 @@ def main() -> int:
 
     dataset_name = args.dataset_name or output_dir.name
 
+    # Process training dataset
     transforms_path = blender_dir / "transforms.json"
     if not transforms_path.exists():
         raise FileNotFoundError(f"{transforms_path} not found")
@@ -660,7 +727,57 @@ def main() -> int:
     print(f"Loaded transforms.json with {len(transforms.get('frames', []))} frames")
 
     metadata = copy_frames_to_dataset(blender_dir, output_dir, transforms)
-    print(f"Copied data for {len(metadata)} cameras to {output_dir}")
+    print(f"Copied training data for {len(metadata)} cameras to {output_dir}")
+
+    # Process test dataset
+    test_blender_dir = args.test_blender.expanduser().resolve()
+    test_transforms_path = test_blender_dir / args.test_transforms
+    test_metadata = None
+    if test_transforms_path.exists():
+        test_transforms = json.loads(test_transforms_path.read_text())
+        print(
+            f"Loaded {args.test_transforms} with {len(test_transforms.get('frames', []))} frames"
+        )
+
+        test_metadata = copy_frames_to_dataset(
+            test_blender_dir,
+            output_dir,
+            test_transforms,
+            camera_id_offset=len(metadata),
+        )
+        print(f"Copied test data for {len(test_metadata)} cameras to {output_dir}")
+    else:
+        print(
+            f"Warning: Test transforms not found at {test_transforms_path}, skipping test dataset"
+        )
+
+    # Process video dataset
+    video_blender_dir = args.video_blender
+    if video_blender_dir is None:
+        video_blender_dir = test_blender_dir
+    else:
+        video_blender_dir = video_blender_dir.expanduser().resolve()
+
+    video_transforms_path = video_blender_dir / args.video_transforms
+    video_metadata = None
+    if video_transforms_path.exists():
+        video_transforms = json.loads(video_transforms_path.read_text())
+        print(
+            f"Loaded {args.video_transforms} with {len(video_transforms.get('frames', []))} frames for video"
+        )
+
+        video_metadata = copy_frames_to_dataset(
+            video_blender_dir,
+            output_dir,
+            video_transforms,
+            camera_id_offset=len(metadata)
+            + (len(test_metadata) if test_metadata else 0),
+        )
+        print(f"Copied video data for {len(video_metadata)} cameras to {output_dir}")
+    else:
+        print(
+            f"Warning: Video transforms not found at {video_transforms_path}, skipping video dataset"
+        )
 
     all_frames = gather_all_frames(metadata)
     per_camera_frames = select_first_frame_per_camera(metadata)
@@ -681,9 +798,20 @@ def main() -> int:
         )
         if conda_env == "":
             conda_env = None
-        run_vggt_demo(vggt_script_path, tmp_scene_dir, conda_env)
+        run_vggt_demo(
+            vggt_script_path, tmp_scene_dir, conda_env, args.vggt_conf_threshold
+        )
 
         vggt_points, vggt_colors, pose_by_name = load_vggt_outputs(tmp_scene_dir)
+
+        if vggt_points.size == 0:
+            print("WARNING: VGGT produced an empty point cloud (0 3D points)")
+            print(
+                "This may occur with multifocal cameras or insufficient feature matches"
+            )
+            print(
+                "Proceeding without 3D points - training may still work with camera poses"
+            )
 
         vggt_centers = []
         blender_centers = []
@@ -724,13 +852,44 @@ def main() -> int:
         [points["red"], points["green"], points["blue"]], axis=1
     ).astype(np.uint8)
 
+    # Create separate sparse directories for train, test, and video
+    train_frames = gather_all_frames(metadata)
+    sparse_dir_train = output_dir / "sparse_train"
+    create_reconstruction(
+        train_frames, transforms, sparse_dir_train, point_positions, point_colors
+    )
+
+    if test_metadata:
+        test_frames = gather_all_frames(test_metadata)
+        sparse_dir_test = output_dir / "sparse_test"
+        create_reconstruction(
+            test_frames, test_transforms, sparse_dir_test, point_positions, point_colors
+        )
+
+    if video_metadata:
+        video_frames = gather_all_frames(video_metadata)
+        sparse_dir_video = output_dir / "sparse_video"
+        create_reconstruction(
+            video_frames,
+            video_transforms,
+            sparse_dir_video,
+            point_positions,
+            point_colors,
+        )
+
+    # Also create the combined sparse_ for compatibility
+    all_frames_combined = (
+        train_frames
+        + (test_frames if test_metadata else [])
+        + (video_frames if video_metadata else [])
+    )
     sparse_dir = output_dir / "sparse_"
     create_reconstruction(
-        all_frames, transforms, sparse_dir, point_positions, point_colors
+        all_frames_combined, transforms, sparse_dir, point_positions, point_colors
     )
 
     compute_poses_bounds_from_frames(
-        all_frames,
+        train_frames,
         point_positions,
         transforms,
         output_dir / "poses_bounds_multipleview.npy",
@@ -744,8 +903,9 @@ def main() -> int:
     print(
         "  python train.py -s",
         output_dir,
-        f'--expname "multipleview/{dataset_name}" --configs arguments/multipleview/{dataset_name}.py',
+        f'--expname "multipleview/{dataset_name}"',
     )
+    print("\n(config.py will be auto-detected from the dataset directory)")
 
     return 0
 

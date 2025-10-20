@@ -50,37 +50,43 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    store_video = name != "train"
     render_images = []
-    gt_list = []
-    render_list = []
     print("point nums:",gaussians._xyz.shape[0])
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if idx == 0:time1 = time()
-        
+        if idx == 0:
+            time1 = time()
+
         render_pkg = render(view, gaussians, pipeline, background, cam_type=cam_type)
         rendering = render_pkg["render"]
         if idx == 0:
             print(
                 f"Render stats -> min: {rendering.min().item():.4f}, max: {rendering.max().item():.4f}, mean: {rendering.mean().item():.4f}"
             )
-        render_images.append(to8b(rendering).transpose(1,2,0))
-        render_list.append(rendering)
+        render_cpu = rendering.detach().cpu()
+        if store_video:
+            render_images.append(to8b(render_cpu).transpose(1,2,0))
+
+        torchvision.utils.save_image(
+            render_cpu, os.path.join(render_path, f"{idx:05d}.png")
+        )
+
         if name in ["train", "test"]:
             if cam_type != "PanopticSports":
-                gt = view.original_image[0:3, :, :]
+                gt = view.original_image[0:3, :, :].detach().cpu()
             else:
-                gt  = view['image'].cuda()
-            gt_list.append(gt)
+                gt = view["image"].detach().cpu()
+            torchvision.utils.save_image(gt, os.path.join(gts_path, f"{idx:05d}.png"))
 
     time2=time()
     print("FPS:",(len(views)-1)/(time2-time1))
 
-    multithread_write(gt_list, gts_path)
-
-    multithread_write(render_list, render_path)
-
-    
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'video_rgb.mp4'), render_images, fps=30)
+    if store_video:
+        imageio.mimwrite(
+            os.path.join(model_path, name, f"ours_{iteration}", "video_rgb.mp4"),
+            render_images,
+            fps=30,
+        )
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, hyperparam)
@@ -107,9 +113,18 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_video", action="store_true")
-    parser.add_argument("--configs", type=str)
+    parser.add_argument("--configs", type=str, default="")
     args = get_combined_args(parser)
     print("Rendering " , args.model_path)
+
+    # Auto-detect config.py in source directory if --configs not provided
+    if not args.configs:
+        from pathlib import Path
+        auto_config = Path(args.source_path) / "config.py"
+        if auto_config.exists():
+            args.configs = str(auto_config)
+            print(f"Auto-detected config at: {args.configs}")
+
     if args.configs:
         config = load_config(args.configs)
         args = merge_hparams(args, config)

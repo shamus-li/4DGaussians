@@ -354,7 +354,7 @@ def format_infos(dataset,split):
     # loading
     cameras = []
     image = dataset[0][0]
-    if split == "train":
+    if split in ["train", "video", "test"]:
         for idx in tqdm(range(len(dataset))):
             image_path = None
             image_name = f"{idx}"
@@ -595,13 +595,36 @@ def readPanopticSportsinfos(datadir):
 
 def readMultipleViewinfos(datadir,llffhold=8):
 
-    cameras_extrinsic_file = os.path.join(datadir, "sparse_/images.bin")
-    cameras_intrinsic_file = os.path.join(datadir, "sparse_/cameras.bin")
-    cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-    cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    # Load training cameras
+    cameras_extrinsic_file_train = os.path.join(datadir, "sparse_train/images.bin")
+    cameras_intrinsic_file_train = os.path.join(datadir, "sparse_train/cameras.bin")
+    cam_extrinsics_train = read_extrinsics_binary(cameras_extrinsic_file_train)
+    cam_intrinsics_train = read_intrinsics_binary(cameras_intrinsic_file_train)
     from scene.multipleview_dataset import multipleview_dataset
-    train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="train")
-    test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="test")
+    train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="train")
+
+    # Load test cameras if available
+    cameras_extrinsic_file_test = os.path.join(datadir, "sparse_test/images.bin")
+    cameras_intrinsic_file_test = os.path.join(datadir, "sparse_test/cameras.bin")
+    if os.path.exists(cameras_extrinsic_file_test) and os.path.exists(cameras_intrinsic_file_test):
+        cam_extrinsics_test = read_extrinsics_binary(cameras_extrinsic_file_test)
+        cam_intrinsics_test = read_intrinsics_binary(cameras_intrinsic_file_test)
+        test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_test, cam_intrinsics=cam_intrinsics_test, cam_folder=datadir,split="all")
+    else:
+        # Fallback to old behavior - sample from training cameras
+        test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="test")
+
+    # Load video cameras if available
+    cameras_extrinsic_file_video = os.path.join(datadir, "sparse_video/images.bin")
+    cameras_intrinsic_file_video = os.path.join(datadir, "sparse_video/cameras.bin")
+    if os.path.exists(cameras_extrinsic_file_video) and os.path.exists(cameras_intrinsic_file_video):
+        cam_extrinsics_video = read_extrinsics_binary(cameras_extrinsic_file_video)
+        cam_intrinsics_video = read_intrinsics_binary(cameras_intrinsic_file_video)
+        video_cam_infos_dataset = multipleview_dataset(cam_extrinsics=cam_extrinsics_video, cam_intrinsics=cam_intrinsics_video, cam_folder=datadir,split="all")
+        video_cam_infos = format_infos(video_cam_infos_dataset, "video")
+    else:
+        # Fallback to old behavior - use test cameras
+        video_cam_infos = test_cam_infos.video_cam_infos if hasattr(test_cam_infos, 'video_cam_infos') else []
 
     train_cam_infos_ = format_infos(train_cam_infos,"train")
     nerf_normalization = getNerfppNorm(train_cam_infos_)
@@ -616,17 +639,17 @@ def readMultipleViewinfos(datadir,llffhold=8):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-    
+
     try:
         pcd = fetchPly(ply_path)
-        
+
     except:
         pcd = None
-    
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
-                           video_cameras=test_cam_infos.video_cam_infos,
+                           video_cameras=video_cam_infos,
                            maxtime=0,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)

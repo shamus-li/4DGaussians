@@ -68,10 +68,13 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
         print("Loading Training Cameras")
         self.train_camera = FourDGSdataset(scene_info.train_cameras, args, dataset_type)
+        print(f"  Loaded {len(scene_info.train_cameras)} training cameras")
         print("Loading Test Cameras")
         self.test_camera = FourDGSdataset(scene_info.test_cameras, args, dataset_type)
+        print(f"  Loaded {len(scene_info.test_cameras)} test cameras")
         print("Loading Video Cameras")
         self.video_camera = FourDGSdataset(scene_info.video_cameras, args, dataset_type)
+        print(f"  Loaded {len(scene_info.video_cameras)} video cameras")
 
         # self.video_camera = cameraList_from_camInfos(scene_info.video_cameras,-1,args)
         xyz_max = scene_info.point_cloud.points.max(axis=0)

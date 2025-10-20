@@ -49,7 +49,9 @@ class multipleview_dataset(Dataset):
 
             if split == "test":
                 indices = sorted({0, image_length // 3, (2 * image_length) // 3})
-            else:
+            elif split == "all":
+                indices = range(image_length)
+            else:  # train
                 indices = range(image_length)
 
             for idx in indices:
