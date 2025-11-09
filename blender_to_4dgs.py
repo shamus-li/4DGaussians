@@ -72,6 +72,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from scene.colmap_loader import qvec2rotmat, read_extrinsics_binary  # noqa: E402
+from utils.config_templates import generate_multiview_config  # noqa: E402
 
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -158,17 +159,15 @@ def resolve_source_image(blender_dir: Path, file_path: str) -> Path:
     raise FileNotFoundError(f"Could not locate source image for {file_path}")
 
 
-def convert_image_to_jpeg(src: Path, dst: Path) -> Tuple[int, int]:
+def convert_image_to_png(src: Path, dst: Path) -> Tuple[int, int]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(src) as img:
         width, height = img.size
         if img.mode in ("RGBA", "LA"):
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[-1])
-            img = background
-        elif img.mode != "RGB":
+            img = img.convert("RGBA")
+        else:
             img = img.convert("RGB")
-        img.save(dst, format="JPEG", quality=95)
+        img.save(dst, format="PNG")
     return width, height
 
 
@@ -197,8 +196,8 @@ def copy_frames_to_dataset(
 
         for seq_idx, frame in enumerate(ordered_frames):
             src_path = resolve_source_image(blender_dir, frame["file_path"])
-            dst_path = cam_dir / f"frame_{seq_idx + 1:05d}.jpg"
-            width, height = convert_image_to_jpeg(src_path, dst_path)
+            dst_path = cam_dir / f"frame_{seq_idx + 1:05d}.png"
+            width, height = convert_image_to_png(src_path, dst_path)
 
             # Extract per-frame focal lengths, fallback to global transforms
             if "fl_x" in frame and "fl_y" in frame:
@@ -272,57 +271,142 @@ def select_first_frame_per_camera(metadata: Dict[str, Dict]) -> List[FrameRecord
     return selected
 
 
-def prepare_vggt_scene(frames: Iterable[FrameRecord], scene_dir: Path) -> None:
+def downsample_vggt_frames(
+    frames: List[FrameRecord], max_count: Optional[int]
+) -> List[FrameRecord]:
+    if max_count is None or max_count <= 0 or len(frames) <= max_count:
+        return list(frames)
+
+    step = len(frames) / float(max_count)
+    selected_indices: List[int] = []
+    seen: set[int] = set()
+
+    for i in range(max_count):
+        idx = min(int(round(i * step)), len(frames) - 1)
+        if idx not in seen:
+            selected_indices.append(idx)
+            seen.add(idx)
+
+    if len(selected_indices) < max_count:
+        for idx in range(len(frames)):
+            if idx not in seen:
+                selected_indices.append(idx)
+                seen.add(idx)
+                if len(selected_indices) == max_count:
+                    break
+
+    selected_indices.sort()
+    return [frames[idx] for idx in selected_indices]
+
+
+def prepare_vggt_scene(
+    frames: Iterable[FrameRecord],
+    scene_dir: Path,
+    max_cameras: Optional[int] = None,
+) -> List[FrameRecord]:
     images_dir = scene_dir / "images"
     if images_dir.exists():
         shutil.rmtree(images_dir)
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    for frame in frames:
+    frame_list = list(frames)
+    for frame in frame_list:
+        frame.tmp_basename = None
+
+    selected_frames = downsample_vggt_frames(frame_list, max_cameras)
+    if max_cameras and len(frame_list) > len(selected_frames):
+        print(
+            f"Downsampling VGGT inputs from {len(frame_list)} to {len(selected_frames)} cameras to reduce memory"
+        )
+
+    for frame in selected_frames:
         basename = f"{frame.camera_name}_{frame.dst_path.name}"
         shutil.copy2(frame.dst_path, images_dir / basename)
         frame.tmp_basename = basename
 
+    return selected_frames
 
-def run_vggt_demo(
+
+def run_vggt_pipeline(
     demo_script: Path,
     scene_dir: Path,
     conda_env: Optional[str],
-    conf_threshold: float = 1.0,
-) -> None:
+    conf_threshold: float,
+    vis_threshold: float,
+    min_inliers: int,
+    run_bundle_adjust: bool = False,
+    query_frame_num: Optional[int] = None,
+    max_query_points: Optional[int] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> str:
     if not demo_script.exists():
         raise FileNotFoundError(f"VGGT script not found at {demo_script}")
 
-    if conda_env:
-        cmd = [
-            "conda",
-            "run",
-            "-n",
-            conda_env,
-            "python",
-            str(demo_script),
-            "--scene_dir",
-            str(scene_dir),
-            "--stage",
-            "vggt",
-            "--conf_thres_value",
-            str(conf_threshold),
-        ]
-    else:
-        cmd = [
-            sys.executable,
-            str(demo_script),
-            "--scene_dir",
-            str(scene_dir),
-            "--stage",
-            "vggt",
-            "--conf_thres_value",
-            str(conf_threshold),
-        ]
-    print("->", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=demo_script.parent, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("VGGT demo_colmap execution failed")
+    def build_args(enable_ba: bool) -> Tuple[str, List[str]]:
+        if enable_ba:
+            stage_name = "both"
+            arg_list = [
+                "--use_ba",
+                "--conf_thres_value",
+                str(conf_threshold),
+                "--vis_thresh",
+                str(vis_threshold),
+                "--min_inlier_per_frame",
+                str(min_inliers),
+            ]
+        else:
+            stage_name = "vggt"
+            arg_list = ["--conf_thres_value", str(conf_threshold)]
+        if query_frame_num:
+            arg_list.extend(["--query_frame_num", str(query_frame_num)])
+        if max_query_points:
+            arg_list.extend(["--max_query_pts", str(max_query_points)])
+        return stage_name, arg_list
+
+    def run_once(enable_ba: bool) -> Tuple[int, str]:
+        stage_name, extra_args = build_args(enable_ba)
+        if conda_env:
+            cmd = [
+                "conda",
+                "run",
+                "-n",
+                conda_env,
+                "python",
+                str(demo_script),
+                "--scene_dir",
+                str(scene_dir),
+                "--stage",
+                stage_name,
+                *extra_args,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                str(demo_script),
+                "--scene_dir",
+                str(scene_dir),
+                "--stage",
+                stage_name,
+                *extra_args,
+            ]
+        print("->", " ".join(cmd))
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+        result = subprocess.run(cmd, cwd=demo_script.parent, check=False, env=env)
+        return result.returncode, stage_name
+
+    return_code, stage = run_once(run_bundle_adjust)
+    if return_code != 0 and run_bundle_adjust:
+        print(
+            "[WARN] VGGT bundle-adjust stage failed; retrying without BA for "
+            f"{scene_dir}"
+        )
+        return_code, stage = run_once(False)
+
+    if return_code != 0:
+        raise RuntimeError(f"VGGT script failed during stage '{stage}'")
+    return stage
 
 
 def load_vggt_outputs(
@@ -587,44 +671,17 @@ def compute_poses_bounds_from_frames(
     np.save(output_path, np.stack(data))
 
 
-def create_config_file(output_dir: Path, dataset_name: str) -> None:
+def create_config_file(
+    output_dir: Path, dataset_name: str, camera_count: int, frame_count: int
+) -> None:
     config_path = output_dir / "config.py"
 
-    content = """ModelHiddenParams = dict(
-    kplanes_config = {
-        'grid_dimensions': 2,
-        'input_coordinate_dim': 4,
-        'output_coordinate_dim': 16,
-        'resolution': [64, 64, 64, 150]
-    },
-    multires = [1, 2],
-    defor_depth = 0,
-    net_width = 128,
-    plane_tv_weight = 0.0002,
-    time_smoothness_weight = 0.001,
-    l1_time_planes = 0.0001,
-    no_do = False,
-    no_dshs = False,
-    no_ds = False,
-    empty_voxel = False,
-    render_process = True,
-    static_mlp = False,
-)
-
-OptimizationParams = dict(
-    dataloader = True,
-    iterations = 15000,
-    batch_size = 1,
-    coarse_iterations = 3000,
-    densify_until_iter = 10000,
-    opacity_threshold_coarse = 0.005,
-    opacity_threshold_fine_init = 0.005,
-    opacity_threshold_fine_after = 0.005,
-)
-"""
+    config_body = generate_multiview_config(
+        camera_count, frame_count, dataset_name=dataset_name
+    )
 
     with open(config_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(config_body)
 
 
 def parse_args() -> argparse.Namespace:
@@ -686,7 +743,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_point_cloud_points",
         type=int,
-        default=40000,
+        default=300000,
         help="Downsample target for the fused point cloud (0 disables)",
     )
     parser.add_argument(
@@ -704,8 +761,97 @@ def parse_args() -> argparse.Namespace:
         "--vggt_conf_threshold",
         type=float,
         default=3.0,
-        help="Confidence threshold for VGGT point cloud generation (default: 1.0, VGGT default: 5.0)",
+        help="Confidence threshold for VGGT point cloud generation (default: 3.0, VGGT default: 5.0)",
     )
+    parser.add_argument(
+        "--vggt_vis_threshold",
+        type=float,
+        default=0.05,
+        help="Visibility threshold for VGGT tracks during bundle adjustment (default: 0.05, ignored unless --enable_bundle_adjust is set)",
+    )
+    parser.add_argument(
+        "--vggt_min_inliers",
+        type=int,
+        default=16,
+        help="Minimum inliers per frame required by VGGT bundle adjustment (default: 16, ignored unless --enable_bundle_adjust is set)",
+    )
+    parser.add_argument(
+        "--enable_bundle_adjust",
+        action="store_true",
+        help="Run VGGT bundle adjustment after the initial reconstruction (disabled by default)",
+    )
+    parser.add_argument(
+        "--vggt_image_resolution",
+        type=int,
+        default=1024,
+        help="Base square resolution for VGGT input images (default: 1024)",
+    )
+    parser.add_argument(
+        "--vggt_fixed_resolution",
+        type=int,
+        default=518,
+        help="Internal feature-map resolution used by VGGT (default: 518)",
+    )
+    parser.add_argument(
+        "--vggt_query_frame_num",
+        type=int,
+        default=8,
+        help="Value passed to demo_colmap.py --query_frame_num (default: 8)",
+    )
+    parser.add_argument(
+        "--vggt_max_query_points",
+        type=int,
+        default=4096,
+        help="Value passed to demo_colmap.py --max_query_pts (default: 4096)",
+    )
+    parser.add_argument(
+        "--vggt_max_cameras",
+        type=int,
+        default=0,
+        help="Optional cap on number of cameras passed to VGGT (0 keeps all cameras)",
+    )
+    parser.add_argument(
+        "--vggt_skip_tracks",
+        action="store_true",
+        help="Skip VGGT track prediction entirely to reduce memory usage",
+    )
+    parser.add_argument(
+        "--vggt_low_memory_threshold",
+        type=int,
+        default=80,
+        help="Enable low-memory VGGT settings when camera count exceeds this threshold (0 disables)",
+    )
+    parser.add_argument(
+        "--vggt_low_memory_resolution",
+        type=int,
+        default=768,
+        help="VGGT image resolution to use in low-memory mode",
+    )
+    parser.add_argument(
+        "--vggt_low_memory_query_frames",
+        type=int,
+        default=4,
+        help="Query frame count to use in low-memory VGGT mode",
+    )
+    parser.add_argument(
+        "--vggt_low_memory_query_points",
+        type=int,
+        default=2048,
+        help="Max query points to use in low-memory VGGT mode",
+    )
+    parser.add_argument(
+        "--vggt_low_memory_max_cameras",
+        type=int,
+        default=96,
+        help="Camera cap applied when low-memory VGGT mode is active (0 keeps existing limit)",
+    )
+    parser.add_argument(
+        "--keep_vggt_tracks_low_mem",
+        action="store_false",
+        dest="vggt_low_memory_skip_tracks",
+        help="Keep VGGT track prediction when low-memory mode triggers",
+    )
+    parser.set_defaults(vggt_low_memory_skip_tracks=True)
     return parser.parse_args()
 
 
@@ -781,6 +927,7 @@ def main() -> int:
 
     all_frames = gather_all_frames(metadata)
     per_camera_frames = select_first_frame_per_camera(metadata)
+    vggt_camera_count = len(per_camera_frames)
 
     point_cloud_path = output_dir / "points3D_multipleview.ply"
 
@@ -792,30 +939,133 @@ def main() -> int:
             raise ValueError("--vggt_script must be specified when VGGT is enabled")
 
         tmp_scene_dir = output_dir / "tmp_colmap"
-        prepare_vggt_scene(per_camera_frames, tmp_scene_dir)
+        limit_cameras: Optional[int] = (
+            args.vggt_max_cameras if args.vggt_max_cameras > 0 else None
+        )
+        image_resolution = max(
+            args.vggt_fixed_resolution, args.vggt_image_resolution
+        )
+        fixed_resolution = max(64, args.vggt_fixed_resolution)
+        query_frame_num = max(1, args.vggt_query_frame_num)
+        max_query_points = max(256, args.vggt_max_query_points)
+        skip_tracks = bool(args.vggt_skip_tracks)
+
+        low_memory = (
+            args.vggt_low_memory_threshold > 0
+            and vggt_camera_count > args.vggt_low_memory_threshold
+        )
+        if low_memory:
+            print(
+                f"VGGT low-memory mode enabled: {vggt_camera_count} cameras exceed threshold {args.vggt_low_memory_threshold}"
+            )
+            if args.vggt_low_memory_skip_tracks:
+                skip_tracks = True
+
+        if limit_cameras is not None and limit_cameras < 3:
+            limit_cameras = 3
+
+        vggt_frames = prepare_vggt_scene(
+            per_camera_frames, tmp_scene_dir, max_cameras=limit_cameras
+        )
+        if not vggt_frames:
+            raise RuntimeError("No frames selected for VGGT reconstruction")
+        if len(vggt_frames) != vggt_camera_count:
+            print(
+                f"Using {len(vggt_frames)} of {vggt_camera_count} cameras for VGGT reconstruction"
+            )
         conda_env = (
             args.vggt_conda_env.strip() if args.vggt_conda_env is not None else None
         )
         if conda_env == "":
             conda_env = None
-        run_vggt_demo(
-            vggt_script_path, tmp_scene_dir, conda_env, args.vggt_conf_threshold
-        )
 
-        vggt_points, vggt_colors, pose_by_name = load_vggt_outputs(tmp_scene_dir)
+        base_env_overrides: Dict[str, str] = {
+            "VGGT_IMG_RES": str(image_resolution),
+            "VGGT_FIXED_RES": str(fixed_resolution),
+        }
+        attempt_specs: List[Tuple[float, bool]] = []
 
-        if vggt_points.size == 0:
-            print("WARNING: VGGT produced an empty point cloud (0 3D points)")
-            print(
-                "This may occur with multifocal cameras or insufficient feature matches"
+        def add_attempt(conf_value: float, skip: bool) -> None:
+            value = max(0.0, float(conf_value))
+            key = (round(value, 4), skip)
+            if key not in attempt_specs:
+                attempt_specs.append(key)
+
+        add_attempt(args.vggt_conf_threshold, skip_tracks)
+        if args.vggt_conf_threshold > 2.0:
+            add_attempt(2.0, skip_tracks)
+        if args.vggt_conf_threshold > 1.2:
+            add_attempt(1.2, skip_tracks)
+        add_attempt(0.6, skip_tracks)
+        add_attempt(0.0, skip_tracks)
+        if skip_tracks:
+            add_attempt(0.0, False)
+
+        vggt_points: np.ndarray | None = None
+        vggt_colors: np.ndarray | None = None
+        pose_by_name: Dict[str, Tuple[np.ndarray, np.ndarray]] | None = None
+        sparse_dir = tmp_scene_dir / "sparse"
+        cache_file = tmp_scene_dir / "cache_vggt_result.pt"
+
+        ba_enabled = args.enable_bundle_adjust
+
+        for attempt_idx, (conf_value, attempt_skip_tracks) in enumerate(
+            attempt_specs
+        ):
+            if attempt_idx > 0:
+                print(
+                    f"Retrying VGGT with conf_thres={conf_value} "
+                    f"{'(skip tracks)' if attempt_skip_tracks else '(tracks enabled)'}"
+                )
+
+            if sparse_dir.exists():
+                shutil.rmtree(sparse_dir, ignore_errors=True)
+            if cache_file.exists():
+                cache_file.unlink()
+
+            env_overrides = dict(base_env_overrides)
+            if attempt_skip_tracks:
+                env_overrides["VGGT_SKIP_TRACKS"] = "1"
+
+            stage_used = run_vggt_pipeline(
+                vggt_script_path,
+                tmp_scene_dir,
+                conda_env=conda_env,
+                conf_threshold=conf_value,
+                vis_threshold=args.vggt_vis_threshold,
+                min_inliers=max(1, args.vggt_min_inliers),
+                run_bundle_adjust=ba_enabled,
+                query_frame_num=query_frame_num,
+                max_query_points=max_query_points,
+                extra_env=env_overrides,
             )
+            print(f"VGGT stage used: {stage_used}")
+            if ba_enabled and stage_used != "both":
+                print("[WARN] VGGT bundle adjustment unavailable; continuing without BA for remaining attempts.")
+                ba_enabled = False
+
+            try:
+                vggt_points, vggt_colors, pose_by_name = load_vggt_outputs(
+                    tmp_scene_dir
+                )
+            except FileNotFoundError:
+                continue
+
+            if vggt_points.size > 0:
+                break
+
             print(
-                "Proceeding without 3D points - training may still work with camera poses"
+                f"VGGT run with conf_thres={conf_value} produced 0 points – retrying"
+            )
+
+        if vggt_points is None or vggt_points.size == 0 or pose_by_name is None:
+            raise RuntimeError(
+                "VGGT produced no 3D points even after fallback attempts"
             )
 
         vggt_centers = []
         blender_centers = []
-        for frame in per_camera_frames:
+        for frame in vggt_frames:
             if frame.tmp_basename is None:
                 raise RuntimeError("Temporary VGGT image name missing")
             if frame.tmp_basename not in pose_by_name:
@@ -895,7 +1145,11 @@ def main() -> int:
         output_dir / "poses_bounds_multipleview.npy",
     )
 
-    create_config_file(output_dir, dataset_name)
+    camera_count = len(metadata)
+    frame_counts = [len(info["frames"]) for info in metadata.values()]
+    frame_count = max(frame_counts) if frame_counts else 0
+
+    create_config_file(output_dir, dataset_name, camera_count, frame_count)
 
     print("Conversion complete. Dataset ready at:", output_dir)
     print("To train 4DGaussians:")

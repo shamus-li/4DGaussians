@@ -74,6 +74,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if name in ["train", "test"]:
             if cam_type != "PanopticSports":
                 gt = view.original_image[0:3, :, :].detach().cpu()
+                alpha = getattr(view, "alpha_mask", None)
+                if alpha is not None:
+                    alpha = alpha.detach().cpu()
+                else:
+                    alpha = torch.ones((1, gt.shape[1], gt.shape[2]))
+                bg = background.detach().cpu().view(3, 1, 1)
+                gt = gt * alpha + bg * (1.0 - alpha)
             else:
                 gt = view["image"].detach().cpu()
             torchvision.utils.save_image(gt, os.path.join(gts_path, f"{idx:05d}.png"))

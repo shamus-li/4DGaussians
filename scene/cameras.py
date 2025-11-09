@@ -36,18 +36,14 @@ class Camera(nn.Module):
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
-        self.original_image = image.clamp(0.0, 1.0)[:3,:,:]
-        # breakpoint()
-        # .to(self.data_device)
+        self.original_image = image.clamp(0.0, 1.0)[:3, :, :]
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
         if gt_alpha_mask is not None:
-            self.original_image *= gt_alpha_mask
-            # .to(self.data_device)
+            self.alpha_mask = gt_alpha_mask.clamp(0.0, 1.0)
         else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width))
-                                                #   , device=self.data_device)
+            self.alpha_mask = torch.ones((1, self.image_height, self.image_width))
         self.depth = depth
         self.mask = mask
         self.zfar = 100.0
@@ -76,4 +72,3 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
         self.time = time
-

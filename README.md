@@ -165,9 +165,9 @@ python scripts/downsample_point.py data/hypernerf/virg/broom2/colmap/dense/works
 python train.py -s  data/hypernerf/virg/broom2/ --port 6017 --expname "hypernerf/broom2" --configs arguments/hypernerf/broom2.py 
 ```
 
-For training multipleviews scenes,you are supposed to build a configuration file named (you dataset name).py under "./arguments/mutipleview",after that,run
+For training multipleviews scenes, first generate the dataset with `video_to_4dgs.py` (or `blender_to_4dgs.py`). The converter writes a tuned `config.py` into your dataset directory automatically, so training becomes:
 ```python
-python train.py -s  data/multipleview/(your dataset name) --port 6017 --expname "multipleview/(your dataset name)" --configs arguments/multipleview/(you dataset name).py 
+python train.py -s data/multipleview/(your dataset name) --port 6017 --expname "multipleview/(your dataset name)"
 ```
 
 
@@ -202,7 +202,7 @@ python train.py -s data/dnerf/bouncingballs --port 6017 --expname "dnerf/bouncin
 Run the following script to render the images.
 
 ```
-python render.py --model_path "output/dnerf/bouncingballs/"  --skip_train --configs arguments/dnerf/bouncingballs.py 
+python render.py --model_path "output/dnerf/bouncingballs/" --skip_train
 ```
 
 ## Evaluation

@@ -44,7 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.add_points=False
         self.extension=".png"
         self.llffhold=8
+        self.match_string = ""
+        self.filter_training = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -70,6 +72,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.antialiasing = False
         super().__init__(parser, "Pipeline Parameters")
 class ModelHiddenParams(ParamGroup):
     def __init__(self, parser):
@@ -145,8 +148,15 @@ class OptimizationParams(ParamGroup):
         self.opacity_threshold_coarse = 0.005
         self.opacity_threshold_fine_init = 0.005
         self.opacity_threshold_fine_after = 0.005
+        self.max_screen_size = 0.0
+        self.prune_min_points = 200000
         self.batch_size=1
         self.add_point=False
+        self.random_background = False
+        self.random_background_coarse_only = False
+        self.min_gaussians = 0
+        self.min_gaussians_warmup = 0
+        self.min_gaussians_cooldown = 200
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
@@ -162,7 +172,8 @@ def get_combined_args(parser : ArgumentParser):
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
-            cfg_loaded = True
+            resume_checkpoint = getattr(args_cmdline, "start_checkpoint", None)
+            cfg_loaded = bool(resume_checkpoint)
     except TypeError:
         print("Config file not found at")
         pass

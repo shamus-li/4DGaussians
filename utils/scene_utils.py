@@ -24,7 +24,15 @@ def render_training_image(scene, gaussians, viewpoints, render_func, pipe, backg
         if dataset_type == "PanopticSports":
             gt_np = viewpoint['image'].permute(1,2,0).cpu().numpy()
         else:
-            gt_np = viewpoint.original_image.permute(1,2,0).cpu().numpy()
+            gt = viewpoint.original_image[0:3, :, :].cpu()
+            alpha = getattr(viewpoint, "alpha_mask", None)
+            if alpha is not None:
+                alpha = alpha.cpu().expand_as(gt)
+            else:
+                alpha = torch.ones_like(gt)
+            bg = background.detach().cpu().view(3, 1, 1)
+            gt = gt * alpha + bg * (1.0 - alpha)
+            gt_np = gt.permute(1, 2, 0).numpy()
         image_np = image.permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
         depth_np = depth.permute(1, 2, 0).cpu().numpy()
         depth_np /= depth_np.max()
@@ -65,4 +73,3 @@ def visualize_and_save_point_cloud(point_cloud, R, T, filename):
     ax.scatter(transformed_point_cloud[0], transformed_point_cloud[1], transformed_point_cloud[2], c='g', marker='o')
     ax.axis("off")
     plt.savefig(filename)
-

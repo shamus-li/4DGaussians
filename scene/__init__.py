@@ -59,11 +59,14 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["PanopticSports"](args.source_path)
             dataset_type="PanopticSports"
         elif os.path.exists(os.path.join(args.source_path,"points3D_multipleview.ply")):
-            scene_info = sceneLoadTypeCallbacks["MultipleView"](args.source_path)
+            match_string = getattr(args, 'match_string', None)
+            filter_training = getattr(args, 'filter_training', False)
+            scene_info = sceneLoadTypeCallbacks["MultipleView"](args.source_path, 8, match_string, filter_training)
             dataset_type="MultipleView"
         else:
             assert False, "Could not recognize scene type!"
         self.maxtime = scene_info.maxtime
+        self.base_point_cloud = scene_info.point_cloud
         self.dataset_type = dataset_type
         self.cameras_extent = scene_info.nerf_normalization["radius"]
         print("Loading Training Cameras")

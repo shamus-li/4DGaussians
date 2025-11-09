@@ -12,7 +12,20 @@ def merge_hparams(args, config):
                 else:
                     setattr(args, key, value)
 
+    _merge_misc_keys(args, config, prefer_existing)
     return args
+
+
+def _merge_misc_keys(args, config, prefer_existing):
+    """Merge non-paramgroup keys from config into args."""
+    for key, value in config.items():
+        if key in {"OptimizationParams", "ModelHiddenParams", "ModelParams", "PipelineParams"}:
+            continue
+        if hasattr(args, key):
+            current = getattr(args, key)
+            if prefer_existing and current is not None:
+                continue
+            setattr(args, key, value)
 
 
 def load_config(config_path):

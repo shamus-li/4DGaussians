@@ -14,7 +14,14 @@ import os
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2  # type: ignore
+    _HAVE_SIMPLE_KNN = True
+except Exception:
+    # Fallback path when the CUDA extension is not available. We will estimate
+    # an initialization distance heuristically during point-cloud initialization
+    # to avoid hard dependency on the extension for testing and CI runs.
+    _HAVE_SIMPLE_KNN = False
 from torch import nn
 
 from scene.deformation import deform_network
@@ -159,10 +166,29 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(
-            distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
-            0.0000001,
-        )
+        if _HAVE_SIMPLE_KNN:
+            dist2 = torch.clamp_min(
+                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+                1e-7,
+            )
+        else:
+            # Heuristic neighbor distance: approximate average spacing from
+            # point density to initialize reasonable Gaussian scales.
+            pts = np.asarray(pcd.points)
+            if pts.size == 0:
+                raise RuntimeError("Empty point cloud provided for initialization")
+            mins = pts.min(axis=0)
+            maxs = pts.max(axis=0)
+            extents = np.maximum(maxs - mins, 1e-6)
+            volume = float(extents[0] * extents[1] * extents[2])
+            n = max(1, pts.shape[0])
+            # Characteristic spacing between points in a roughly uniform grid
+            cell = (volume / n) ** (1.0 / 3.0)
+            # Slightly inflate to avoid degenerate covariances
+            spacing = max(cell * 1.25, 1e-3)
+            dist2 = torch.full(
+                (n,), float(spacing * spacing), dtype=torch.float, device="cuda"
+            )
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -705,19 +731,53 @@ class GaussianModel:
         return selected_xyz, new_xyz
 
     def prune(self, max_grad, min_opacity, extent, max_screen_size):
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # Base low-opacity criterion
+        opac = self.get_opacity.squeeze()
+        base_low_opacity = opac < min_opacity
 
+        # Always enforce removal of pathological big splats
+        forced_mask = torch.zeros_like(base_low_opacity, dtype=torch.bool)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(prune_mask, big_points_vs)
+            forced_mask = torch.logical_or(big_points_vs, big_points_ws)
 
-            prune_mask = torch.logical_or(
-                torch.logical_or(prune_mask, big_points_vs), big_points_ws
-            )
-        self.prune_points(prune_mask)
+        prune_mask = torch.logical_or(base_low_opacity, forced_mask)
 
-        torch.cuda.empty_cache()
+        # Cap pruning aggressiveness per call to protect against collapse
+        total = prune_mask.numel()
+        max_fraction = 0.25  # prune at most 25% per invocation
+        max_prune = int(max_fraction * total)
+        num_prune = int(prune_mask.sum().item())
+        if num_prune > max_prune:
+            # Keep forced removals, limit low-opacity removals to fill the remainder
+            remaining = max(0, max_prune - int(forced_mask.sum().item()))
+            if remaining <= 0:
+                prune_mask = forced_mask
+            else:
+                # Select the lowest-opacitiy subset among candidates
+                candidates = torch.nonzero(base_low_opacity & ~forced_mask, as_tuple=False).squeeze(1)
+                if candidates.numel() > 0:
+                    cand_opac = opac[candidates]
+                    try:
+                        # torch.topk on negated opacity selects smallest values
+                        k = min(remaining, candidates.numel())
+                        _, idx = torch.topk(-cand_opac, k, largest=True, sorted=False)
+                        keep_idx = candidates[idx]
+                    except Exception:
+                        # Fallback: threshold by quantile if topk fails
+                        q = remaining / max(1, candidates.numel())
+                        thr = torch.quantile(cand_opac, q)
+                        keep_idx = candidates[cand_opac <= thr]
+                    limited_mask = torch.zeros_like(prune_mask)
+                    limited_mask[keep_idx] = True
+                    prune_mask = torch.logical_or(forced_mask, limited_mask)
+                else:
+                    prune_mask = forced_mask
+
+        if prune_mask.any():
+            self.prune_points(prune_mask)
+            torch.cuda.empty_cache()
 
     def densify(
         self,

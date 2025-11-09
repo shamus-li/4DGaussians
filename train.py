@@ -69,7 +69,9 @@ def scene_reconstruction(
             # process is in the coarse stage, but start from fine stage
             return
         if stage in checkpoint:
-            (model_params, first_iter) = torch.load(checkpoint)
+            (model_params, first_iter) = torch.load(
+                checkpoint, map_location="cuda", weights_only=False
+            )
             gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -83,6 +85,10 @@ def scene_reconstruction(
     ema_psnr_for_log = 0.0
 
     final_iter = train_iter
+
+    guard_min_points = getattr(opt, "min_gaussians", 0) if stage == "coarse" else 0
+    guard_resume_iter = getattr(opt, "min_gaussians_warmup", 0)
+    guard_cooldown = max(getattr(opt, "min_gaussians_cooldown", 200), 50)
 
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
@@ -98,6 +104,10 @@ def scene_reconstruction(
     #
     batch_size = opt.batch_size
     print("data loading done")
+
+    max_screen_size = getattr(opt, "max_screen_size", 0.0)
+    prune_min_points = getattr(opt, "prune_min_points", 200000)
+
     if opt.dataloader:
         viewpoint_stack = scene.getTrainCameras()
         if opt.custom_sampler is not None:
@@ -136,6 +146,34 @@ def scene_reconstruction(
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # Safeguard: Check for Gaussian collapse and reinitialize if needed
+        current_count = gaussians.get_xyz.shape[0]
+        critical_threshold = max(guard_min_points, 100) if guard_min_points else 100
+
+        if iteration > guard_resume_iter and current_count < critical_threshold:
+            if getattr(scene, "base_point_cloud", None) is not None and current_count > 0:
+                print(
+                    f"[SAFEGUARD] Reinitializing Gaussians from source point cloud at iteration {iteration} "
+                    f"(count={current_count}, threshold={critical_threshold})"
+                )
+                gaussians.create_from_pcd(
+                    scene.base_point_cloud, scene.cameras_extent, scene.maxtime
+                )
+                gaussians.training_setup(opt)
+                guard_resume_iter = iteration + guard_cooldown
+                continue
+            elif current_count == 0:
+                # CRITICAL: Cannot continue with 0 Gaussians
+                error_msg = (
+                    f"[CRITICAL ERROR] Gaussian collapse detected at iteration {iteration}!\n"
+                    f"All {critical_threshold if guard_min_points else 'tracked'} Gaussians have been pruned.\n"
+                )
+                if not getattr(scene, "base_point_cloud", None):
+                    error_msg += "No base point cloud available for recovery.\n"
+                error_msg += "Training cannot continue. Please check your hyperparameters."
+                print(error_msg)
+                raise RuntimeError(error_msg)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -183,12 +221,20 @@ def scene_reconstruction(
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
+        alpha_masks = []
+        all_cams_have_alpha = True
+        use_random_background = getattr(opt, "random_background", False)
+        coarse_only = getattr(opt, "random_background_coarse_only", False)
+        if use_random_background and (not coarse_only or stage == "coarse"):
+            iteration_background = torch.rand_like(background)
+        else:
+            iteration_background = background
         for viewpoint_cam in viewpoint_cams:
             render_pkg = render(
                 viewpoint_cam,
                 gaussians,
                 pipe,
-                background,
+                iteration_background,
                 stage=stage,
                 cam_type=scene.dataset_type,
             )
@@ -198,11 +244,31 @@ def scene_reconstruction(
                 render_pkg["visibility_filter"],
                 render_pkg["radii"],
             )
+            if viewspace_point_tensor.shape[0] == 0 or viewspace_point_tensor.shape[1] == 0:
+                print(
+                    f"[WARN] Empty viewspace tensor at iteration {iteration} (shape={viewspace_point_tensor.shape})"
+                )
+            expected_vp_shape = viewspace_point_tensor.shape
+            viewspace_point_tensor.retain_grad()
+            viewspace_point_tensor.register_hook(
+                lambda grad: grad
+                if grad.shape == expected_vp_shape
+                else grad.new_zeros(expected_vp_shape)
+            )
             images.append(image.unsqueeze(0))
             if scene.dataset_type != "PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
+                alpha_mask = getattr(viewpoint_cam, "alpha_mask", None)
+                if alpha_mask is not None:
+                    alpha = alpha_mask.to(gt_image.device)
+                    alpha_masks.append(alpha.unsqueeze(0))
+                else:
+                    alpha = torch.ones((1, gt_image.shape[1], gt_image.shape[2]), device=gt_image.device)
+                    all_cams_have_alpha = False
+                gt_image = gt_image * alpha + iteration_background.view(3, 1, 1) * (1.0 - alpha)
             else:
                 gt_image = viewpoint_cam["image"].cuda()
+                all_cams_have_alpha = False
 
             gt_images.append(gt_image.unsqueeze(0))
             radii_list.append(radii.unsqueeze(0))
@@ -215,7 +281,23 @@ def scene_reconstruction(
         gt_image_tensor = torch.cat(gt_images, 0)
         # Loss
         # breakpoint()
-        Ll1 = l1_loss(image_tensor, gt_image_tensor[:, :3, :, :])
+        if (
+            scene.dataset_type != "PanopticSports"
+            and all_cams_have_alpha
+            and len(alpha_masks) == len(viewpoint_cams)
+            and alpha_masks
+        ):
+            alpha_tensor = torch.cat(alpha_masks, dim=0).to(image_tensor.device)
+            alpha_expanded = alpha_tensor.expand(-1, image_tensor.shape[1], -1, -1)
+            masked_prediction = image_tensor * alpha_expanded
+            masked_target = gt_image_tensor[:, :3, :, :] * alpha_expanded
+            mask_mass = alpha_tensor.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+            Ll1 = (
+                torch.abs(masked_prediction - masked_target).sum(dim=(1, 2, 3))
+                / (mask_mass * image_tensor.shape[1])
+            ).mean()
+        else:
+            Ll1 = l1_loss(image_tensor, gt_image_tensor[:, :3, :, :])
 
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
@@ -262,12 +344,16 @@ def scene_reconstruction(
                 )
                 progress_bar.update(10)
             if iteration % 500 == 0 or iteration == first_iter:
-                opacity_stats = gaussians.get_opacity
-                print(
-                    f"[{stage}] Iteration {iteration}: {gaussians.get_xyz.shape[0]} gaussians, "
-                    f"opacity mean={opacity_stats.mean().item():.4f}, "
-                    f"min={opacity_stats.min().item():.4f}, max={opacity_stats.max().item():.4f}"
-                )
+                gaussian_count = gaussians.get_xyz.shape[0]
+                if gaussian_count > 0:
+                    opacity_stats = gaussians.get_opacity
+                    print(
+                        f"[{stage}] Iteration {iteration}: {gaussian_count} gaussians, "
+                        f"opacity mean={opacity_stats.mean().item():.4f}, "
+                        f"min={opacity_stats.min().item():.4f}, max={opacity_stats.max().item():.4f}"
+                    )
+                else:
+                    print(f"[{stage}] Iteration {iteration}: WARNING - 0 gaussians remaining!")
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -352,14 +438,34 @@ def scene_reconstruction(
                         )
                         / (opt.densify_until_iter)
                     )
+
+                # Adaptive opacity threshold: More conservative when Gaussian count is low
+                current_count = gaussians.get_xyz.shape[0]
+                if current_count < 10000:
+                    # Scale down threshold to be more conservative
+                    # When count is low, we need to be more careful about pruning
+                    scale_factor = max(0.3, current_count / 10000)  # 0.3x to 1.0x scaling
+                    original_threshold = opacity_threshold
+                    opacity_threshold = opacity_threshold * scale_factor
+                    if iteration % 500 == 0 and scale_factor < 1.0:  # Log when adapting
+                        print(f"[ADAPTIVE THRESHOLD] count={current_count}, "
+                              f"opacity_threshold={original_threshold:.4f} -> {opacity_threshold:.4f} "
+                              f"(scale={scale_factor:.2f})")
                 if (
                     iteration > opt.densify_from_iter
                     and iteration % opt.densification_interval == 0
                     and gaussians.get_xyz.shape[0] < 360000
                 ):
-                    size_threshold = (
-                        20 if iteration > opt.opacity_reset_interval else None
-                    )
+                    pre_densify_count = gaussians.get_xyz.shape[0]
+                    if iteration % 500 == 0:  # Log every 500 iterations
+                        print(f"[DENSIFY] Iteration {iteration}: Running densification (pre_count={pre_densify_count}, threshold={densify_threshold})")
+
+                    if max_screen_size and max_screen_size > 0:
+                        size_threshold = max_screen_size
+                    else:
+                        size_threshold = (
+                            20 if iteration > opt.opacity_reset_interval else None
+                        )
 
                     gaussians.densify(
                         densify_threshold,
@@ -372,14 +478,34 @@ def scene_reconstruction(
                         iteration,
                         stage,
                     )
+
+                    post_densify_count = gaussians.get_xyz.shape[0]
+                    if iteration % 500 == 0:  # Log every 500 iterations
+                        delta = post_densify_count - pre_densify_count
+                        print(f"[DENSIFY] Iteration {iteration}: Complete (post_count={post_densify_count}, delta={delta:+d})")
+                elif iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    if iteration % 500 == 0:  # Log skipped densification
+                        print(f"[DENSIFY] Iteration {iteration}: Skipped (count={gaussians.get_xyz.shape[0]} >= 360000 or disabled)")
+                # Per-stage pruning control: Skip pruning in coarse stage
+                # Coarse stage is for initialization - pruning can destabilize before convergence
+                skip_pruning_coarse = (stage == "coarse")
+
                 if (
                     iteration > opt.pruning_from_iter
                     and iteration % opt.pruning_interval == 0
-                    and gaussians.get_xyz.shape[0] > 200000
+                    and gaussians.get_xyz.shape[0] > prune_min_points
+                    and not skip_pruning_coarse
                 ):
-                    size_threshold = (
-                        20 if iteration > opt.opacity_reset_interval else None
-                    )
+                    pre_prune_count = gaussians.get_xyz.shape[0]
+                    if iteration % 500 == 0:  # Log every 500 iterations
+                        print(f"[PRUNE] Iteration {iteration}: Running explicit pruning (pre_count={pre_prune_count}, opacity_threshold={opacity_threshold:.4f})")
+
+                    if max_screen_size and max_screen_size > 0:
+                        size_threshold = max_screen_size
+                    else:
+                        size_threshold = (
+                            20 if iteration > opt.opacity_reset_interval else None
+                        )
 
                     gaussians.prune(
                         densify_threshold,
@@ -387,6 +513,21 @@ def scene_reconstruction(
                         scene.cameras_extent,
                         size_threshold,
                     )
+
+                    post_prune_count = gaussians.get_xyz.shape[0]
+                    if iteration % 500 == 0:  # Log every 500 iterations
+                        delta = post_prune_count - pre_prune_count
+                        print(f"[PRUNE] Iteration {iteration}: Complete (post_count={post_prune_count}, delta={delta:+d})")
+                elif iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0:
+                    if iteration % 500 == 0:  # Log skipped pruning
+                        skip_reason = []
+                        if gaussians.get_xyz.shape[0] <= prune_min_points:
+                            skip_reason.append(f"count={gaussians.get_xyz.shape[0]}<={prune_min_points}")
+                        if skip_pruning_coarse:
+                            skip_reason.append("coarse_stage")
+                        if not skip_reason:
+                            skip_reason.append("disabled by config")
+                        print(f"[PRUNE] Iteration {iteration}: Skipped ({', '.join(skip_reason)})")
 
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                 if (
@@ -396,7 +537,12 @@ def scene_reconstruction(
                 ):
                     gaussians.grow(5, 5, scene.model_path, iteration, stage)
                     # torch.cuda.empty_cache()
-                if iteration % opt.opacity_reset_interval == 0:
+                if (
+                    opt.opacity_reset_interval > 0
+                    and iteration % opt.opacity_reset_interval == 0
+                    and iteration < opt.iterations
+                    and iteration < getattr(opt, 'densify_until_iter', opt.iterations)
+                ):
                     print("reset opacity")
                     gaussians.reset_opacity()
 
@@ -635,6 +781,53 @@ def training_report(
         torch.cuda.empty_cache()
 
 
+def post_training_evaluation(
+    args,
+    dataset_params,
+    hyper_params,
+    pipeline_params,
+    final_iteration,
+):
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    try:
+        from render import render_sets
+
+        print(
+            f"\nPost-training rendering for iteration {final_iteration} at {args.model_path}"
+        )
+        render_sets(
+            dataset_params,
+            hyper_params,
+            final_iteration,
+            pipeline_params,
+            skip_train=not args.post_render_train,
+            skip_test=args.post_render_skip_test,
+            skip_video=args.post_render_skip_video,
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics
+        print(f"[WARN] Rendering after training failed: {exc}")
+        return
+
+    if args.post_render_skip_test:
+        print(
+            "[INFO] Skipping metrics evaluation because test views were not rendered."
+        )
+        return
+
+    try:
+        from metrics import evaluate as metrics_evaluate
+
+        print("\nPost-training metrics evaluation")
+        metrics_evaluate([args.model_path])
+    except Exception as exc:  # pragma: no cover - diagnostics
+        print(f"[WARN] Metric evaluation after training failed: {exc}")
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -642,6 +835,47 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+def apply_filtered_training_overrides(args):
+    """Adjust optimization knobs when --filter_training is enabled to keep Gaussians from collapsing."""
+    if not getattr(args, "filter_training", False):
+        return args
+
+    # Keep substantially more points alive before allowing any pruning/densification to remove them.
+    args.min_gaussians = max(getattr(args, "min_gaussians", 0), 4000)
+    args.min_gaussians_warmup = max(getattr(args, "min_gaussians_warmup", 0), 800)
+    args.min_gaussians_cooldown = max(getattr(args, "min_gaussians_cooldown", 0), 200)
+
+    # Disable explicit pruning entirely for filtered training; the coarse stage is prone to over-pruning otherwise.
+    args.pruning_from_iter = max(
+        getattr(args, "pruning_from_iter", 0), args.iterations + 1
+    )
+    args.prune_min_points = max(getattr(args, "prune_min_points", 0), 1_000_000)
+
+    # CRITICAL FIX: Also disable densification to prevent implicit pruning via densify_and_split.
+    # Densification causes Gaussian collapse in few-camera scenarios because densify_and_split
+    # prunes the original Gaussians after splitting them, which can remove all Gaussians when
+    # the selection criteria select all points (common with poor few-camera initialization).
+    args.densify_from_iter = max(
+        getattr(args, "densify_from_iter", 0), args.iterations + 1
+    )
+
+    # Slow down remaining densification operations (though densify_from_iter should disable them)
+    args.percent_dense = min(getattr(args, "percent_dense", 0.04), 0.025)
+    args.random_background = False
+    args.random_background_coarse_only = True
+
+    # Give the coarse stage more room to converge and extend total iterations for the tougher setting.
+    args.coarse_iterations = max(getattr(args, "coarse_iterations", 0), 6000)
+    args.iterations = max(getattr(args, "iterations", 0), 28_000)
+
+    print(f"[FILTERED TRAINING] Applied stability overrides:")
+    print(f"  - min_gaussians: {args.min_gaussians}")
+    print(f"  - pruning_from_iter: {args.pruning_from_iter}")
+    print(f"  - densify_from_iter: {args.densify_from_iter}")
+    print(f"  - coarse_iterations: {args.coarse_iterations}")
+    print(f"  - iterations: {args.iterations}")
+
+    return args
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -671,6 +905,23 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--expname", type=str, default="")
     parser.add_argument("--configs", type=str, default="")
+    parser.add_argument("--skip_post_eval", action="store_true")
+    parser.add_argument(
+        "--post_render_train",
+        action="store_true",
+        help="Render training views after training (default: skip)",
+    )
+    parser.add_argument(
+        "--post_render_skip_test",
+        action="store_true",
+        help="Skip rendering test views after training",
+    )
+    parser.add_argument(
+        "--post_render_skip_video",
+        action="store_true",
+        help="Skip rendering video trajectory after training",
+    )
+    # Note: --match_string is automatically added by ModelParams class
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -686,6 +937,7 @@ if __name__ == "__main__":
     if args.configs:
         config = load_config(args.configs)
         args = merge_hparams(args, config)
+    args = apply_filtered_training_overrides(args)
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
@@ -693,11 +945,15 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    model_params = lp.extract(args)
+    hyper_params = hp.extract(args)
+    opt_params = op.extract(args)
+    pipe_params = pp.extract(args)
     training(
-        lp.extract(args),
-        hp.extract(args),
-        op.extract(args),
-        pp.extract(args),
+        model_params,
+        hyper_params,
+        opt_params,
+        pipe_params,
         args.test_iterations,
         args.save_iterations,
         args.checkpoint_iterations,
@@ -705,6 +961,15 @@ if __name__ == "__main__":
         args.debug_from,
         args.expname,
     )
+
+    if not args.skip_post_eval:
+        post_training_evaluation(
+            args,
+            model_params,
+            hyper_params,
+            pipe_params,
+            opt_params.iterations,
+        )
 
     # All done
     print("\nTraining complete.")

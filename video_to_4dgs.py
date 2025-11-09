@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -79,6 +81,7 @@ from scene.colmap_loader import (  # noqa: E402
     read_extrinsics_binary,
     rotmat2qvec,
 )
+from utils.config_templates import generate_multiview_config  # noqa: E402
 
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -113,7 +116,7 @@ SUPPORTED_VIDEO_EXTS = (
     ".m4v",
     ".webm",
 )
-JPEG_QUALITY = 95
+
 
 
 @dataclass
@@ -175,12 +178,10 @@ def save_frame(frame_array: np.ndarray, dst_path: Path) -> Tuple[int, int]:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.fromarray(frame_array)
     if image.mode in ("RGBA", "LA"):
-        background = Image.new("RGB", image.size, (255, 255, 255))
-        background.paste(image, mask=image.split()[-1])
-        image = background
-    elif image.mode != "RGB":
+        image = image.convert("RGBA")
+    else:
         image = image.convert("RGB")
-    image.save(dst_path, format="JPEG", quality=JPEG_QUALITY)
+    image.save(dst_path, format="PNG")
     width, height = image.size
     return width, height
 
@@ -202,7 +203,7 @@ def extract_frames(
             saved_index += 1
             if max_frames is not None and saved_index > max_frames:
                 break
-            dst_path = camera_dir / f"frame_{saved_index:05d}.jpg"
+            dst_path = camera_dir / f"frame_{saved_index:05d}.png"
             width, height = save_frame(frame_array, dst_path)
             frames.append(
                 RawFrame(index=saved_index, path=dst_path, width=width, height=height)
@@ -582,50 +583,17 @@ def compute_poses_bounds(
     np.save(output_path, np.stack(data))
 
 
-def create_config_file(output_dir: Path, dataset_name: str, camera_count: int) -> None:
+def create_config_file(
+    output_dir: Path, dataset_name: str, camera_count: int, frame_count: int
+) -> None:
     config_path = output_dir / "config.py"
 
-    opacity_coarse = 0.005
-    opacity_init = 0.005
-    opacity_after = 0.005
-    densify_until = 10000
-    coarse_iterations = 3000
-
-    content = f"""ModelHiddenParams = dict(
-    kplanes_config = {{
-        'grid_dimensions': 2,
-        'input_coordinate_dim': 4,
-        'output_coordinate_dim': 16,
-        'resolution': [64, 64, 64, 150]
-    }},
-    multires = [1, 2],
-    defor_depth = 0,
-    net_width = 128,
-    plane_tv_weight = 0.0002,
-    time_smoothness_weight = 0.001,
-    l1_time_planes = 0.0001,
-    no_do = False,
-    no_dshs = False,
-    no_ds = False,
-    empty_voxel = False,
-    render_process = True,
-    static_mlp = False,
-)
-
-OptimizationParams = dict(
-    dataloader = True,
-    iterations = 15000,
-    batch_size = 1,
-    coarse_iterations = {coarse_iterations},
-    densify_until_iter = {densify_until},
-    opacity_threshold_coarse = {opacity_coarse},
-    opacity_threshold_fine_init = {opacity_init},
-    opacity_threshold_fine_after = {opacity_after},
-)
-"""
+    config_body = generate_multiview_config(
+        camera_count, frame_count, dataset_name=dataset_name
+    )
 
     with open(config_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(config_body)
 
 
 def parse_args() -> argparse.Namespace:
@@ -711,6 +679,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the temporary VGGT scene directory inside the output",
     )
+    parser.add_argument(
+        "--legacy_naming",
+        action="store_true",
+        help="Use legacy cam_XXXXX naming instead of preserving video filenames",
+    )
     return parser.parse_args()
 
 
@@ -726,93 +699,163 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_name = args.dataset_name or output_dir.name
 
-    video_files = collect_video_files(video_root, recursive=args.recursive)
-    print(f"Found {len(video_files)} video(s)")
+    # Sentinels to coordinate multi-task pipelines
+    in_progress_path = output_dir / ".conversion_in_progress"
+    done_path = output_dir / ".conversion_done"
+    # Clear any stale 'done' file and mark conversion as in-progress atomically
+    try:
+        if done_path.exists():
+            done_path.unlink()
+    except Exception:
+        pass
+    tmp_inp = in_progress_path.with_suffix(in_progress_path.suffix + ".tmp")
+    try:
+        tmp_inp.write_text(
+            json.dumps({"ok": False, "ts": datetime.now().isoformat()}),
+            encoding="utf-8",
+        )
+        tmp_inp.replace(in_progress_path)
+    except Exception:
+        # Non-fatal; continue conversion even if sentinel cannot be written
+        pass
 
-    sequences: List[CameraSequence] = []
-    for idx, video_path in enumerate(video_files):
-        camera_name = f"cam_{idx + 1:05d}"
-        camera_dir = output_dir / camera_name
-        frames = extract_frames(
-            video_path,
-            camera_dir,
-            frame_stride=max(1, args.frame_stride),
-            max_frames=args.max_frames,
+    success = False
+    
+    try:
+        video_files = collect_video_files(video_root, recursive=args.recursive)
+        print(f"Found {len(video_files)} video(s)")
+
+        sequences: List[CameraSequence] = []
+        for idx, video_path in enumerate(video_files):
+            if args.legacy_naming:
+                camera_name = f"cam_{idx + 1:05d}"
+            else:
+                # Use video filename (without extension) as camera name
+                original_stem = video_path.stem
+                # Sanitize: replace spaces/hyphens with underscores, keep only ASCII alphanumeric
+                video_stem = original_stem.replace(" ", "_").replace("-", "_")
+                # Keep only ASCII letters, numbers, and underscores
+                video_stem = "".join(c if (c.isalnum() and ord(c) < 128) or c == "_" else "_" for c in video_stem)
+                # Remove consecutive underscores and strip leading/trailing underscores
+                import re
+                video_stem = re.sub(r"_+", "_", video_stem).strip("_")
+                # Fallback to generic name if sanitization results in empty string
+                if not video_stem:
+                    video_stem = "camera"
+                    print(f"WARNING: Video name '{original_stem}' could not be sanitized, using '{video_stem}'")
+                # Limit length to avoid filesystem issues (max 50 chars for base name)
+                if len(video_stem) > 50:
+                    video_stem = video_stem[:50].rstrip("_")
+                    print(f"WARNING: Video name '{original_stem}' truncated to '{video_stem}'")
+                camera_name = f"{video_stem}_{idx + 1:03d}"
+
+            camera_dir = output_dir / camera_name
+            frames = extract_frames(
+                video_path,
+                camera_dir,
+                frame_stride=max(1, args.frame_stride),
+                max_frames=args.max_frames,
+            )
+            sequences.append(
+                CameraSequence(name=camera_name, video_path=video_path, frames=frames)
+            )
+            print(
+                f"Extracted {len(frames)} frame(s) from {video_path.name} -> {camera_dir.relative_to(output_dir)}"
+            )
+
+        frame_count = harmonize_frame_counts(sequences)
+        print(f"All cameras will use {frame_count} frame(s)")
+
+        tmp_scene_dir = output_dir / "tmp_vggt"
+        if tmp_scene_dir.exists():
+            shutil.rmtree(tmp_scene_dir)
+        tmp_scene_dir.mkdir(parents=True, exist_ok=True)
+
+        prepare_vggt_scene(sequences, tmp_scene_dir)
+
+        conda_env = args.vggt_conda_env.strip() if args.vggt_conda_env is not None else None
+        if conda_env == "":
+            conda_env = None
+
+        vggt_script = args.vggt_script.expanduser().resolve()
+        run_vggt_pipeline(
+            vggt_script,
+            tmp_scene_dir,
+            conda_env=conda_env,
+            conf_threshold=args.vggt_conf_threshold,
+            vis_threshold=args.vggt_vis_threshold,
+            min_inliers=max(1, args.vggt_min_inliers),
+            run_bundle_adjust=True,
         )
-        sequences.append(
-            CameraSequence(name=camera_name, video_path=video_path, frames=frames)
+
+        points, colors, cameras, images_by_name = load_vggt_outputs(tmp_scene_dir)
+        if points.size == 0:
+            raise RuntimeError("VGGT did not produce any 3D points. Aborting.")
+
+        down_points, down_colors = maybe_downsample(
+            points, colors, args.max_point_cloud_points
         )
+        point_cloud_path = output_dir / "points3D_multipleview.ply"
+        write_ply(point_cloud_path, down_points, down_colors)
+        print(f"Saved point cloud with {down_points.shape[0]} points -> {point_cloud_path}")
+
+        frames = build_frame_records(sequences, cameras, images_by_name)
+        print(f"Prepared {len(frames)} frame records across {len(sequences)} cameras")
+
+        sparse_dir_train = output_dir / "sparse_train"
+        create_reconstruction(frames, sparse_dir_train, down_points, down_colors)
+        print(f"Wrote COLMAP artifacts to {sparse_dir_train}")
+
+        legacy_sparse_dir = output_dir / "sparse_"
+        shutil.copytree(sparse_dir_train, legacy_sparse_dir, dirs_exist_ok=True)
+        print(f"Duplicated sparse data for legacy path -> {legacy_sparse_dir}")
+
+        poses_bounds_path = output_dir / "poses_bounds_multipleview.npy"
+        compute_poses_bounds(frames, down_points, poses_bounds_path)
+        print(f"Wrote poses & bounds -> {poses_bounds_path}")
+
+        create_config_file(output_dir, dataset_name, len(sequences), frame_count)
+        print(f"Generated training config at {output_dir / 'config.py'}")
+
+        if not args.keep_tmp:
+            shutil.rmtree(tmp_scene_dir, ignore_errors=True)
+
+        # Write conversion done sentinel atomically with metadata
+        try:
+            done_meta = {
+                "ok": True,
+                "ts": datetime.now().isoformat(),
+                "dataset": dataset_name,
+                "cameras": len(sequences),
+                "frames_per_camera": int(frame_count),
+                "total_frames": int(len(sequences) * frame_count),
+                "generator": "video_to_4dgs.py",
+            }
+            tmp_done = done_path.with_suffix(done_path.suffix + ".tmp")
+            tmp_done.write_text(json.dumps(done_meta), encoding="utf-8")
+            tmp_done.replace(done_path)
+        except Exception:
+            # Non-fatal; training can still proceed without metadata
+            pass
+        success = True
+
+        print("Conversion complete. Dataset ready at:", output_dir)
+        print("To train 4DGaussians:")
+        print("  cd", REPO_ROOT)
         print(
-            f"Extracted {len(frames)} frame(s) from {video_path.name} -> {camera_dir.relative_to(output_dir)}"
+            "  python train.py -s",
+            output_dir,
+            f'--expname "multipleview/{dataset_name}"',
         )
-
-    frame_count = harmonize_frame_counts(sequences)
-    print(f"All cameras will use {frame_count} frame(s)")
-
-    tmp_scene_dir = output_dir / "tmp_vggt"
-    if tmp_scene_dir.exists():
-        shutil.rmtree(tmp_scene_dir)
-    tmp_scene_dir.mkdir(parents=True, exist_ok=True)
-
-    prepare_vggt_scene(sequences, tmp_scene_dir)
-
-    conda_env = args.vggt_conda_env.strip() if args.vggt_conda_env is not None else None
-    if conda_env == "":
-        conda_env = None
-
-    vggt_script = args.vggt_script.expanduser().resolve()
-    run_vggt_pipeline(
-        vggt_script,
-        tmp_scene_dir,
-        conda_env=conda_env,
-        conf_threshold=args.vggt_conf_threshold,
-        vis_threshold=args.vggt_vis_threshold,
-        min_inliers=max(1, args.vggt_min_inliers),
-        run_bundle_adjust=True,
-    )
-
-    points, colors, cameras, images_by_name = load_vggt_outputs(tmp_scene_dir)
-    if points.size == 0:
-        raise RuntimeError("VGGT did not produce any 3D points. Aborting.")
-
-    down_points, down_colors = maybe_downsample(
-        points, colors, args.max_point_cloud_points
-    )
-    point_cloud_path = output_dir / "points3D_multipleview.ply"
-    write_ply(point_cloud_path, down_points, down_colors)
-    print(f"Saved point cloud with {down_points.shape[0]} points -> {point_cloud_path}")
-
-    frames = build_frame_records(sequences, cameras, images_by_name)
-    print(f"Prepared {len(frames)} frame records across {len(sequences)} cameras")
-
-    sparse_dir_train = output_dir / "sparse_train"
-    create_reconstruction(frames, sparse_dir_train, down_points, down_colors)
-    print(f"Wrote COLMAP artifacts to {sparse_dir_train}")
-
-    legacy_sparse_dir = output_dir / "sparse_"
-    shutil.copytree(sparse_dir_train, legacy_sparse_dir, dirs_exist_ok=True)
-    print(f"Duplicated sparse data for legacy path -> {legacy_sparse_dir}")
-
-    poses_bounds_path = output_dir / "poses_bounds_multipleview.npy"
-    compute_poses_bounds(frames, down_points, poses_bounds_path)
-    print(f"Wrote poses & bounds -> {poses_bounds_path}")
-
-    create_config_file(output_dir, dataset_name, len(sequences))
-    print(f"Generated training config at {output_dir / 'config.py'}")
-
-    if not args.keep_tmp:
-        shutil.rmtree(tmp_scene_dir, ignore_errors=True)
-
-    print("Conversion complete. Dataset ready at:", output_dir)
-    print("To train 4DGaussians:")
-    print("  cd", REPO_ROOT)
-    print(
-        "  python train.py -s",
-        output_dir,
-        f'--expname "multipleview/{dataset_name}"',
-    )
-    print("\n(config.py will be auto-detected from the dataset directory)")
-    return 0
+        print("\n(config.py will be auto-detected from the dataset directory)")
+        return 0
+    finally:
+        # Always clear in-progress sentinel at the end
+        try:
+            if in_progress_path.exists():
+                in_progress_path.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

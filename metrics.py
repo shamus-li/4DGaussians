@@ -108,7 +108,6 @@ def evaluate(model_paths):
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
         except Exception as e:
-            
             print("Unable to compute metrics for model", scene_dir)
             raise e
 

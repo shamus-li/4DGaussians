@@ -14,7 +14,7 @@ import sys
 from PIL import Image
 from scene.cameras import Camera
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional, Tuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from scene.hyper_loader import Load_hyper_data, format_hyper_data
@@ -30,6 +30,21 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.general_utils import PILtoTorch
 from tqdm import tqdm
+
+
+def load_image_with_alpha(image_path: str, resize: Optional[Tuple[int, int]] = None):
+    """Return (rgb_tensor, alpha_tensor_or_none) from an image path."""
+    with Image.open(image_path) as pil_image:
+        if pil_image.mode in ("RGBA", "LA"):
+            pil_rgba = pil_image.convert("RGBA")
+            alpha = pil_rgba.getchannel("A")
+            rgb_image = pil_rgba.convert("RGB")
+            alpha_tensor = PILtoTorch(alpha, resize)
+        else:
+            rgb_image = pil_image.convert("RGB")
+            alpha_tensor = None
+        image_tensor = PILtoTorch(rgb_image, resize)
+    return image_tensor, alpha_tensor
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -112,11 +127,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
-        image = PILtoTorch(image,None)
+        image, alpha_mask = load_image_with_alpha(image_path)
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height,
-                              time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.
+                              time = float(idx/len(cam_extrinsics)), mask=alpha_mask) # default by monocular settings.
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -276,23 +290,14 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
-
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-            image = PILtoTorch(image,(800,800))
+            image, alpha_mask = load_image_with_alpha(image_path, resize=(800, 800))
             fovy = focal2fov(fov2focal(fovx, image.shape[1]), image.shape[2])
             FovY = fovy 
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.shape[1], height=image.shape[2],
-                            time = time, mask=None))
+                            time = time, mask=alpha_mask))
             
     return cam_infos
 def read_timeline(path):
@@ -350,23 +355,59 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            maxtime=max_time
                            )
     return scene_info
-def format_infos(dataset,split):
-    # loading
+def format_infos(dataset, split):
     cameras = []
-    image = dataset[0][0]
     if split in ["train", "video", "test"]:
-        for idx in tqdm(range(len(dataset))):
-            image_path = None
-            image_name = f"{idx}"
+        total = len(dataset)
+        for idx in tqdm(range(total)):
+            image_path = dataset.image_paths[idx] if hasattr(dataset, "image_paths") else None
+            if image_path is not None:
+                image_tensor, alpha_mask = load_image_with_alpha(image_path)
+                image_name = Path(image_path).stem
+            else:
+                image_tensor = dataset[idx][0]
+                alpha_mask = None
+                image_name = f"{idx}"
+            R, T = dataset.load_pose(idx)
             time = dataset.image_times[idx]
-            # matrix = np.linalg.inv(np.array(pose))
-            R,T = dataset.load_pose(idx)
-            FovX = focal2fov(dataset.focal[0], image.shape[1])
-            FovY = focal2fov(dataset.focal[0], image.shape[2])
-            cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                                time = time, mask=None))
-
+            width = int(image_tensor.shape[2])
+            height = int(image_tensor.shape[1])
+            # Prefer per-image intrinsics if available
+            if hasattr(dataset, "cam_intrinsics") and hasattr(dataset, "camera_ids"):
+                cam_id = dataset.camera_ids[idx]
+                intr = dataset.cam_intrinsics.get(cam_id, None)
+                if intr is not None:
+                    if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "PINHOLE", "OPENCV"]:
+                        fx = float(intr.params[0])
+                        fy = float(intr.params[1]) if intr.model in ["PINHOLE", "OPENCV"] and len(intr.params) > 1 else fx
+                        FovX = focal2fov(fx, intr.width)
+                        FovY = focal2fov(fy, intr.height)
+                    else:
+                        # Fallback to dataset-wide focal if unsupported model
+                        FovX = focal2fov(dataset.focal[0], width)
+                        FovY = focal2fov(dataset.focal[0], height)
+                else:
+                    FovX = focal2fov(dataset.focal[0], width)
+                    FovY = focal2fov(dataset.focal[0], height)
+            else:
+                FovX = focal2fov(dataset.focal[0], width)
+                FovY = focal2fov(dataset.focal[0], height)
+            cameras.append(
+                CameraInfo(
+                    uid=idx,
+                    R=R,
+                    T=T,
+                    FovY=FovY,
+                    FovX=FovX,
+                    image=image_tensor,
+                    image_path=image_path,
+                    image_name=image_name,
+                    width=width,
+                    height=height,
+                    time=time,
+                    mask=alpha_mask,
+                )
+            )
     return cameras
 
 
@@ -593,15 +634,65 @@ def readPanopticSportsinfos(datadir):
                            )
     return scene_info
 
-def readMultipleViewinfos(datadir,llffhold=8):
+def readMultipleViewinfos(datadir,llffhold=8, match_string=None, filter_training=False):
 
     # Load training cameras
     cameras_extrinsic_file_train = os.path.join(datadir, "sparse_train/images.bin")
     cameras_intrinsic_file_train = os.path.join(datadir, "sparse_train/cameras.bin")
     cam_extrinsics_train = read_extrinsics_binary(cameras_extrinsic_file_train)
     cam_intrinsics_train = read_intrinsics_binary(cameras_intrinsic_file_train)
+
+    # Prepare filtering pattern if match_string is provided
+    pattern = None
+    if match_string:
+        import re
+        # Match pattern as a word, allowing underscores to separate words
+        # This allows "wide" to match "wide_001" but not "ultrawide_001"
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9]){re.escape(match_string)}(?![A-Za-z0-9])",
+            flags=re.IGNORECASE
+        )
+
+        # Get unique camera names for debugging
+        camera_names = set(str(Path(v.name).parent) for v in cam_extrinsics_train.values())
+        print(f"\nFound {len(camera_names)} unique cameras: {sorted(camera_names)}")
+
+    # Filter training cameras only if filter_training=True
+    if match_string and filter_training:
+        original_count = len(cam_extrinsics_train)
+        cam_extrinsics_train = {
+            k: v for k, v in cam_extrinsics_train.items()
+            if pattern.search(str(Path(v.name).parent))
+        }
+        if not cam_extrinsics_train:
+            raise ValueError(
+                f"No cameras matched filter '{match_string}'. "
+                f"Check camera names in {cameras_extrinsic_file_train}"
+            )
+        filtered_count = len(cam_extrinsics_train)
+        print(f"\n{'='*70}")
+        print(f"TRAINING CAMERA FILTERING: match_string='{match_string}'")
+        print(f"Selected {filtered_count}/{original_count} training images ({100*filtered_count/original_count:.1f}%)")
+        print(f"{'='*70}\n")
+    elif match_string:
+        print(f"\n{'='*70}")
+        print(f"EVALUATION CAMERA FILTERING: match_string='{match_string}'")
+        print(f"Training cameras: using all {len(cam_extrinsics_train)} images")
+        print(f"Test/video cameras: will be filtered to '{match_string}' only")
+        print(f"{'='*70}\n")
+
     from scene.multipleview_dataset import multipleview_dataset
     train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="train")
+
+    # Create filtered version of training cameras for test/video use (when not using separate sparse_test)
+    # This ensures test/video cameras are filtered even when training cameras are not
+    cam_extrinsics_for_eval = cam_extrinsics_train
+    if pattern is not None and not filter_training:
+        # Training wasn't filtered, but we need filtered cameras for evaluation
+        cam_extrinsics_for_eval = {
+            k: v for k, v in cam_extrinsics_train.items()
+            if pattern.search(str(Path(v.name).parent))
+        }
 
     # Load test cameras if available
     cameras_extrinsic_file_test = os.path.join(datadir, "sparse_test/images.bin")
@@ -609,10 +700,18 @@ def readMultipleViewinfos(datadir,llffhold=8):
     if os.path.exists(cameras_extrinsic_file_test) and os.path.exists(cameras_intrinsic_file_test):
         cam_extrinsics_test = read_extrinsics_binary(cameras_extrinsic_file_test)
         cam_intrinsics_test = read_intrinsics_binary(cameras_intrinsic_file_test)
+
+        # Always filter test cameras when match_string is provided
+        if pattern is not None:
+            cam_extrinsics_test = {
+                k: v for k, v in cam_extrinsics_test.items()
+                if pattern.search(str(Path(v.name).parent))
+            }
+
         test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_test, cam_intrinsics=cam_intrinsics_test, cam_folder=datadir,split="all")
     else:
-        # Fallback to old behavior - sample from training cameras
-        test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="test")
+        # Fallback to old behavior - sample from training cameras (use filtered version for eval)
+        test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_for_eval, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="test")
 
     # Load video cameras if available
     cameras_extrinsic_file_video = os.path.join(datadir, "sparse_video/images.bin")
@@ -620,6 +719,14 @@ def readMultipleViewinfos(datadir,llffhold=8):
     if os.path.exists(cameras_extrinsic_file_video) and os.path.exists(cameras_intrinsic_file_video):
         cam_extrinsics_video = read_extrinsics_binary(cameras_extrinsic_file_video)
         cam_intrinsics_video = read_intrinsics_binary(cameras_intrinsic_file_video)
+
+        # Always filter video cameras when match_string is provided
+        if pattern is not None:
+            cam_extrinsics_video = {
+                k: v for k, v in cam_extrinsics_video.items()
+                if pattern.search(str(Path(v.name).parent))
+            }
+
         video_cam_infos_dataset = multipleview_dataset(cam_extrinsics=cam_extrinsics_video, cam_intrinsics=cam_intrinsics_video, cam_folder=datadir,split="all")
         video_cam_infos = format_infos(video_cam_infos_dataset, "video")
     else:
