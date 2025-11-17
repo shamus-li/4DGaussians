@@ -52,6 +52,7 @@ VIEW_INDEX=$((TASK_ID % TOTAL_VIEWS))
 CAMERA_MODE="${CAMERA_TYPES[CAMERA_INDEX]}"
 N_TRAIN_VIEWS="${VIEW_COUNTS[VIEW_INDEX]}"
 ANIMATION_VIEWS=60
+ADJACENT_EVAL_FRAMES=0
 
 # ---------------------------------------------------------------------------- #
 # User-set configuration shared by all jobs
@@ -77,6 +78,9 @@ TRAIN_ARGS=()
 case "${CAMERA_MODE}" in
     monocular)
         CAMERA_DESC="Monocular"
+        if (( N_TRAIN_VIEWS == 1 )); then
+            ADJACENT_EVAL_FRAMES=6
+        fi
         ;;
     stereo)
         CAMERA_DESC="Stereo"
@@ -108,6 +112,7 @@ FOURD_CONVERT_ARGS=(
     --video_blender "/share/monakhova/shamus_data/multiplexed_pixels/dnerf/lego"
     --video_transforms "transforms_val.json"
     --enable_bundle_adjust
+    --adjacent_eval_frames "${ADJACENT_EVAL_FRAMES}"
 )
 
 FOURD_TRAIN_ARGS=()

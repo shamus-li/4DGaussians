@@ -254,6 +254,86 @@ def copy_frames_to_dataset(
     return metadata
 
 
+def _select_even_indices(length: int, count: int) -> List[int]:
+    if count <= 0 or length <= 0:
+        return []
+    if count >= length:
+        return list(range(length))
+    if count == 1:
+        return [length // 2]
+    step = (length - 1) / float(count - 1)
+    indices: List[int] = []
+    seen = set()
+    for i in range(count):
+        idx = int(round(i * step))
+        idx = max(0, min(length - 1, idx))
+        if idx not in seen:
+            indices.append(idx)
+            seen.add(idx)
+    if len(indices) < count:
+        for idx in range(length):
+            if idx not in seen:
+                indices.append(idx)
+                seen.add(idx)
+            if len(indices) == count:
+                break
+    return sorted(indices)
+
+
+def create_adjacent_eval_metadata(
+    training_metadata: Dict[str, Dict],
+    output_dir: Path,
+    frames_per_camera: int,
+) -> Dict[str, Dict]:
+    """Repurpose a few training frames per camera as adjacent test views."""
+    adjacent_metadata: Dict[str, Dict] = {}
+    eval_counter = 0
+
+    for cam_name in sorted(training_metadata.keys()):
+        info = training_metadata[cam_name]
+        frames = info["frames"]
+        if not frames:
+            continue
+        selected_indices = _select_even_indices(len(frames), frames_per_camera)
+        if not selected_indices:
+            continue
+
+        eval_counter += 1
+        canonical_cam = f"cam_adj_{eval_counter:05d}"
+        cam_dir = output_dir / canonical_cam
+        cam_dir.mkdir(parents=True, exist_ok=True)
+
+        eval_frames: List[FrameRecord] = []
+        for seq_idx, frame_idx in enumerate(selected_indices, start=1):
+            source_frame = frames[frame_idx]
+            dst_path = cam_dir / f"frame_{seq_idx:05d}.png"
+            shutil.copy2(source_frame.dst_path, dst_path)
+            eval_frames.append(
+                FrameRecord(
+                    camera_name=canonical_cam,
+                    camera_original_name=f"{source_frame.camera_original_name}_adj",
+                    frame_index=source_frame.frame_index,
+                    dst_path=dst_path,
+                    transform_matrix=np.array(
+                        source_frame.transform_matrix, copy=True
+                    ),
+                    width=source_frame.width,
+                    height=source_frame.height,
+                    fl_x=source_frame.fl_x,
+                    fl_y=source_frame.fl_y,
+                    cx=source_frame.cx,
+                    cy=source_frame.cy,
+                )
+            )
+
+        adjacent_metadata[canonical_cam] = {
+            "original_name": info["original_name"],
+            "frames": eval_frames,
+        }
+
+    return adjacent_metadata
+
+
 def gather_all_frames(metadata: Dict[str, Dict]) -> List[FrameRecord]:
     frames: List[FrameRecord] = []
     for cam_name in sorted(metadata.keys()):
@@ -852,6 +932,13 @@ def parse_args() -> argparse.Namespace:
         help="Keep VGGT track prediction when low-memory mode triggers",
     )
     parser.set_defaults(vggt_low_memory_skip_tracks=True)
+    parser.add_argument(
+        "--adjacent_eval_frames",
+        type=int,
+        default=0,
+        help="Number of per-camera frames to repurpose as adjacent test views "
+        "(0 disables the synthesized test split).",
+    )
     return parser.parse_args()
 
 
@@ -875,27 +962,45 @@ def main() -> int:
     metadata = copy_frames_to_dataset(blender_dir, output_dir, transforms)
     print(f"Copied training data for {len(metadata)} cameras to {output_dir}")
 
-    # Process test dataset
-    test_blender_dir = args.test_blender.expanduser().resolve()
-    test_transforms_path = test_blender_dir / args.test_transforms
+    # Process test dataset (adjacent-from-train or external transforms)
     test_metadata = None
-    if test_transforms_path.exists():
-        test_transforms = json.loads(test_transforms_path.read_text())
-        print(
-            f"Loaded {args.test_transforms} with {len(test_transforms.get('frames', []))} frames"
-        )
+    test_blender_dir = args.test_blender.expanduser().resolve()
 
-        test_metadata = copy_frames_to_dataset(
-            test_blender_dir,
-            output_dir,
-            test_transforms,
-            camera_id_offset=len(metadata),
-        )
-        print(f"Copied test data for {len(test_metadata)} cameras to {output_dir}")
-    else:
+    if args.adjacent_eval_frames > 0:
         print(
-            f"Warning: Test transforms not found at {test_transforms_path}, skipping test dataset"
+            f"Generating adjacent test views: {args.adjacent_eval_frames} frame(s) per training camera"
         )
+        test_metadata = create_adjacent_eval_metadata(
+            metadata, output_dir, args.adjacent_eval_frames
+        )
+        if test_metadata:
+            print(
+                f"Created {len(test_metadata)} adjacent test camera(s) from training data"
+            )
+        else:
+            print(
+                "Warning: Unable to create adjacent test cameras; proceeding without a test split"
+            )
+    else:
+        test_blender_dir = args.test_blender.expanduser().resolve()
+        test_transforms_path = test_blender_dir / args.test_transforms
+        if test_transforms_path.exists():
+            test_transforms = json.loads(test_transforms_path.read_text())
+            print(
+                f"Loaded {args.test_transforms} with {len(test_transforms.get('frames', []))} frames"
+            )
+
+            test_metadata = copy_frames_to_dataset(
+                test_blender_dir,
+                output_dir,
+                test_transforms,
+                camera_id_offset=len(metadata),
+            )
+            print(f"Copied test data for {len(test_metadata)} cameras to {output_dir}")
+        else:
+            print(
+                f"Warning: Test transforms not found at {test_transforms_path}, skipping test dataset"
+            )
 
     # Process video dataset
     video_blender_dir = args.video_blender

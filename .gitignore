@@ -13,6 +13,7 @@ LLFF/
 docs/
 AGENTS.md
 slurm_logs/
+*.tex
 
 
 # Byte-compiled / optimized / DLL files

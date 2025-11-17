@@ -32,6 +32,39 @@ from utils.general_utils import PILtoTorch
 from tqdm import tqdm
 
 
+def _camera_centers_by_name(cam_extrinsics):
+    """Return average camera center (world coordinates) for each camera directory."""
+    centers = {}
+    for extr in cam_extrinsics.values():
+        cam_name = Path(extr.name).parent.name
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+        center = -R.transpose() @ T
+        centers.setdefault(cam_name, []).append(center)
+    return {
+        cam_name: np.mean(np.stack(samples, axis=0), axis=0)
+        for cam_name, samples in centers.items()
+    }
+
+
+def _select_adjacent_camera_names(train_centers, test_centers, max_neighbors=6):
+    """Return up to max_neighbors test camera names closest to any training camera."""
+    if not train_centers or not test_centers:
+        return []
+
+    scored = []
+    for test_name, test_center in test_centers.items():
+        min_dist = min(
+            np.linalg.norm(test_center - train_center)
+            for train_center in train_centers.values()
+        )
+        scored.append((test_name, float(min_dist)))
+
+    scored.sort(key=lambda item: item[1])
+    max_keep = max(1, int(max_neighbors))
+    return [name for name, _ in scored[:max_keep]]
+
+
 def load_image_with_alpha(image_path: str, resize: Optional[Tuple[int, int]] = None):
     """Return (rgb_tensor, alpha_tensor_or_none) from an image path."""
     with Image.open(image_path) as pil_image:
@@ -641,6 +674,8 @@ def readMultipleViewinfos(datadir,llffhold=8, match_string=None, filter_training
     cameras_intrinsic_file_train = os.path.join(datadir, "sparse_train/cameras.bin")
     cam_extrinsics_train = read_extrinsics_binary(cameras_extrinsic_file_train)
     cam_intrinsics_train = read_intrinsics_binary(cameras_intrinsic_file_train)
+    train_centers = _camera_centers_by_name(cam_extrinsics_train)
+    adjacent_eval_enabled = len(train_centers) <= 1
 
     # Prepare filtering pattern if match_string is provided
     pattern = None
@@ -681,6 +716,12 @@ def readMultipleViewinfos(datadir,llffhold=8, match_string=None, filter_training
         print(f"Test/video cameras: will be filtered to '{match_string}' only")
         print(f"{'='*70}\n")
 
+    if adjacent_eval_enabled:
+        print(
+            "\n[ADJACENT EVAL] Single training camera detected — "
+            "test cameras will be reduced to the closest viewpoints when possible.\n"
+        )
+
     from scene.multipleview_dataset import multipleview_dataset
     train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_train, cam_intrinsics=cam_intrinsics_train, cam_folder=datadir,split="train")
 
@@ -707,6 +748,29 @@ def readMultipleViewinfos(datadir,llffhold=8, match_string=None, filter_training
                 k: v for k, v in cam_extrinsics_test.items()
                 if pattern.search(str(Path(v.name).parent))
             }
+
+        if cam_extrinsics_test and adjacent_eval_enabled:
+            test_centers = _camera_centers_by_name(cam_extrinsics_test)
+            keep_names = _select_adjacent_camera_names(
+                train_centers, test_centers, max_neighbors=6
+            )
+            if keep_names:
+                prev = len(cam_extrinsics_test)
+                cam_extrinsics_test = {
+                    k: v
+                    for k, v in cam_extrinsics_test.items()
+                    if Path(v.name).parent.name in keep_names
+                }
+                print(
+                    "[ADJACENT EVAL] Limiting test cameras to nearest "
+                    f"{len(keep_names)} view(s): {sorted(keep_names)} "
+                    f"(from {prev} total images)."
+                )
+            else:
+                print(
+                    "[ADJACENT EVAL] Unable to identify adjacent test cameras; "
+                    "falling back to the full test set."
+                )
 
         test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics_test, cam_intrinsics=cam_intrinsics_test, cam_folder=datadir,split="all")
     else:

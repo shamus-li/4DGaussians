@@ -29,6 +29,9 @@ from PIL import Image
 from plyfile import PlyData, PlyElement
 
 
+MEGASAM_DIR_NAME = "megasam"
+
+
 def ensure_cudss_accessible() -> None:
     prefix = os.environ.get("CONDA_PREFIX")
     if not prefix:
@@ -149,6 +152,367 @@ class FrameRecord:
     c2w: np.ndarray
 
 
+class MegaSamInitializer:
+    def __init__(self, args: argparse.Namespace, dataset_dir: Path) -> None:
+        self.root = args.megasam_root.expanduser().resolve()
+        self.env = (args.megasam_env or "megasam").strip()
+        self.depth_ckpt = self._resolve_with_root(args.megasam_depth_anything_ckpt)
+        self.tracking_weights = self._resolve_with_root(args.megasam_tracking_weights)
+        self.raft_ckpt = self._resolve_with_root(args.megasam_raft_ckpt)
+        self.da_encoder = args.megasam_da_encoder
+        self.dataset_dir = dataset_dir
+        self.storage_root = dataset_dir / MEGASAM_DIR_NAME
+        self.depth_root = self.storage_root / "Depth-Anything"
+        self.unidepth_root = self.storage_root / "UniDepth"
+        self.outputs_root = self.storage_root / "outputs_cvd"
+        self.depth_root.mkdir(parents=True, exist_ok=True)
+        self.unidepth_root.mkdir(parents=True, exist_ok=True)
+        self.outputs_root.mkdir(parents=True, exist_ok=True)
+        self.env_vars = os.environ.copy()
+        unidepth_path = str(self.root / "UniDepth")
+        existing_py_path = self.env_vars.get("PYTHONPATH", "")
+        if existing_py_path:
+            if unidepth_path not in existing_py_path.split(":"):
+                self.env_vars["PYTHONPATH"] = f"{existing_py_path}:{unidepth_path}"
+        else:
+            self.env_vars["PYTHONPATH"] = unidepth_path
+
+    def _resolve_with_root(self, path: Path) -> Path:
+        expanded = path.expanduser()
+        if expanded.is_absolute():
+            return expanded
+        return (self.root / expanded).resolve()
+
+    def _run_conda_script(self, script: str, extra_args: Sequence[str]) -> None:
+        if self.env:
+            cmd = [
+                "conda",
+                "run",
+                "-n",
+                self.env,
+                "python",
+                script,
+                *extra_args,
+            ]
+        else:
+            cmd = [sys.executable, script, *extra_args]
+        pretty = " ".join(str(x) for x in cmd)
+        print("->", pretty)
+        subprocess.run(cmd, cwd=str(self.root), check=True, env=self.env_vars)
+
+    def run_sequence(self, sequence: "CameraSequence") -> Path:
+        camera_name = sequence.name
+        frame_dir = sequence.frames[0].path.parent
+        depth_scene_dir = self.depth_root / camera_name
+        if depth_scene_dir.exists():
+            shutil.rmtree(depth_scene_dir)
+        depth_scene_dir.mkdir(parents=True, exist_ok=True)
+        unidepth_scene_dir = self.unidepth_root / camera_name
+        if unidepth_scene_dir.exists():
+            shutil.rmtree(unidepth_scene_dir)
+        unidepth_scene_dir.mkdir(parents=True, exist_ok=True)
+
+        self._run_depth_anything(frame_dir, depth_scene_dir)
+        self._run_unidepth(frame_dir, camera_name)
+        self._run_camera_tracking(frame_dir, camera_name)
+        self._run_flow(frame_dir, camera_name)
+        npz_path = self._run_cvd(camera_name)
+        self._cleanup_intermediate(camera_name)
+        return npz_path
+
+    def _run_depth_anything(self, frame_dir: Path, out_dir: Path) -> None:
+        args = [
+            "Depth-Anything/run_videos.py",
+            "--encoder",
+            self.da_encoder,
+            "--load-from",
+            str(self.depth_ckpt),
+            "--img-path",
+            str(frame_dir),
+            "--outdir",
+            str(out_dir),
+        ]
+        self._run_conda_script(args[0], args[1:])
+
+    def _run_unidepth(self, frame_dir: Path, scene_name: str) -> None:
+        args = [
+            "UniDepth/scripts/demo_mega-sam.py",
+            "--img-path",
+            str(frame_dir),
+            "--scene-name",
+            scene_name,
+            "--outdir",
+            str(self.unidepth_root),
+        ]
+        self._run_conda_script(args[0], args[1:])
+
+    def _run_camera_tracking(self, frame_dir: Path, scene_name: str) -> None:
+        args = [
+            "camera_tracking_scripts/test_demo.py",
+            "--datapath",
+            str(frame_dir),
+            "--weights",
+            str(self.tracking_weights),
+            "--scene_name",
+            scene_name,
+            "--mono_depth_path",
+            str(self.depth_root),
+            "--metric_depth_path",
+            str(self.unidepth_root),
+            "--disable_vis",
+        ]
+        self._run_conda_script(args[0], args[1:])
+
+    def _run_flow(self, frame_dir: Path, scene_name: str) -> None:
+        args = [
+            "cvd_opt/preprocess_flow.py",
+            "--datapath",
+            str(frame_dir),
+            "--model",
+            str(self.raft_ckpt),
+            "--scene_name",
+            scene_name,
+            "--mixed_precision",
+        ]
+        self._run_conda_script(args[0], args[1:])
+
+    def _run_cvd(self, scene_name: str) -> Path:
+        args = [
+            "cvd_opt/cvd_opt.py",
+            "--scene_name",
+            scene_name,
+            "--output_dir",
+            str(self.outputs_root),
+        ]
+        self._run_conda_script(args[0], args[1:])
+        npz_path = self.outputs_root / f"{scene_name}_sgd_cvd_hr.npz"
+        if not npz_path.exists():
+            raise FileNotFoundError(f"MegaSaM CVD output missing at {npz_path}")
+        return npz_path
+
+    def _cleanup_intermediate(self, scene_name: str) -> None:
+        recon_dir = self.root / "reconstructions" / scene_name
+        cache_dir = self.root / "cache_flow" / scene_name
+        output_file = self.root / "outputs" / f"{scene_name}_droid.npz"
+        shutil.rmtree(recon_dir, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        try:
+            output_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def collect_vggt_metadata(
+    sequences: Sequence[CameraSequence],
+    images_by_name: Dict[str, ColmapImage],
+    cameras: Dict[int, ColmapCamera],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Tuple[float, float, float, float]]]:
+    cam_to_world: Dict[str, np.ndarray] = {}
+    intrinsics: Dict[str, Tuple[float, float, float, float]] = {}
+    for seq in sequences:
+        if not seq.tmp_image_name:
+            raise RuntimeError(f"Missing VGGT temporary image for {seq.name}")
+        if seq.tmp_image_name not in images_by_name:
+            raise KeyError(
+                f"VGGT image {seq.tmp_image_name} not found for camera {seq.name}"
+            )
+        image = images_by_name[seq.tmp_image_name]
+        if image.camera_id not in cameras:
+            raise KeyError(
+                f"Camera id {image.camera_id} missing for VGGT image {seq.tmp_image_name}"
+            )
+        camera = cameras[image.camera_id]
+        fx, fy, cx, cy = camera_intrinsics_from_colmap(camera)
+        w2c = np.eye(4, dtype=np.float64)
+        w2c[:3, :3] = qvec2rotmat(image.qvec)
+        w2c[:3, 3] = image.tvec
+        c2w = np.linalg.inv(w2c)
+        cam_to_world[seq.name] = c2w
+        intrinsics[seq.name] = (fx, fy, cx, cy)
+    return cam_to_world, intrinsics
+
+
+def compute_cam_to_ref_transforms(
+    cam_to_world: Dict[str, np.ndarray], reference_camera: str
+) -> Dict[str, np.ndarray]:
+    if reference_camera not in cam_to_world:
+        raise KeyError(
+            f"Reference camera '{reference_camera}' not found in VGGT metadata"
+        )
+    ref_c2w = cam_to_world[reference_camera]
+    ref_inv = np.linalg.inv(ref_c2w)
+    transforms: Dict[str, np.ndarray] = {}
+    for name, c2w in cam_to_world.items():
+        transforms[name] = ref_inv @ c2w
+    return transforms
+
+
+def build_hybrid_megasam_records(
+    sequences: Sequence[CameraSequence],
+    reference_sequence: CameraSequence,
+    initializer: MegaSamInitializer,
+    cam_to_ref: Dict[str, np.ndarray],
+    intrinsics: Dict[str, Tuple[float, float, float, float]],
+    frame_count: int,
+    max_point_cloud_points: int,
+    oversample_factor: float,
+) -> Tuple[List[FrameRecord], np.ndarray, np.ndarray]:
+    if frame_count == 0:
+        raise RuntimeError("No frames extracted; cannot run MegaSaM initialization")
+    rng = np.random.default_rng(0)
+    per_frame_quota = max(
+        50,
+        int(
+            oversample_factor
+            * max_point_cloud_points
+            / max(frame_count, 1)
+        ),
+    )
+
+    npz_path = initializer.run_sequence(reference_sequence)
+    ref_records, ref_points, ref_colors = consume_megasam_npz(
+        reference_sequence, npz_path, per_frame_quota, rng
+    )
+
+    if len(ref_records) != frame_count:
+        raise RuntimeError(
+            "MegaSaM reference run produced a different number of frames than expected"
+        )
+
+    all_records: List[FrameRecord] = list(ref_records)
+    ref_name = reference_sequence.name
+    for seq in sequences:
+        if seq.name == ref_name:
+            continue
+        if seq.name not in cam_to_ref:
+            raise KeyError(f"No transform available for camera {seq.name}")
+        if seq.name not in intrinsics:
+            raise KeyError(f"No intrinsics available for camera {seq.name}")
+        transform = cam_to_ref[seq.name]
+        fx, fy, cx, cy = intrinsics[seq.name]
+        if len(seq.frames) != frame_count:
+            raise RuntimeError(
+                f"Camera {seq.name} has {len(seq.frames)} frames, expected {frame_count}"
+            )
+        for idx, raw in enumerate(seq.frames):
+            base_record = ref_records[idx]
+            c2w = base_record.c2w @ transform
+            all_records.append(
+                FrameRecord(
+                    camera_name=seq.name,
+                    frame_index=raw.index,
+                    image_path=raw.path,
+                    width=raw.width,
+                    height=raw.height,
+                    fl_x=fx,
+                    fl_y=fy,
+                    cx=cx,
+                    cy=cy,
+                    c2w=c2w,
+                )
+            )
+
+    all_records.sort(key=lambda fr: (fr.frame_index, fr.camera_name))
+    return all_records, ref_points, ref_colors
+
+
+def consume_megasam_npz(
+    sequence: CameraSequence,
+    npz_path: Path,
+    samples_per_frame: int,
+    rng: np.random.Generator,
+) -> Tuple[List[FrameRecord], np.ndarray, np.ndarray]:
+    data = np.load(npz_path)
+    depths = data["depths"]
+    cam_c2w = data["cam_c2w"]
+    intrinsic = data["intrinsic"]
+    if intrinsic.ndim == 2:
+        intrinsic = np.repeat(intrinsic[None, ...], depths.shape[0], axis=0)
+    if depths.shape[0] != len(sequence.frames):
+        raise RuntimeError(
+            f"MegaSaM produced {depths.shape[0]} frames, expected {len(sequence.frames)}"
+        )
+
+    frame_records: List[FrameRecord] = []
+    sampled_points: List[np.ndarray] = []
+    sampled_colors: List[np.ndarray] = []
+
+    for idx, (raw_frame, depth_map, K) in enumerate(
+        zip(sequence.frames, depths, intrinsic)
+    ):
+        c2w = np.array(cam_c2w[idx], dtype=np.float64)
+        width = raw_frame.width
+        height = raw_frame.height
+        scale_x = width / depth_map.shape[1]
+        scale_y = height / depth_map.shape[0]
+        fx = float(K[0, 0] * scale_x)
+        fy = float(K[1, 1] * scale_y)
+        cx = float(K[0, 2] * scale_x)
+        cy = float(K[1, 2] * scale_y)
+
+        record = FrameRecord(
+            camera_name=sequence.name,
+            frame_index=raw_frame.index,
+            image_path=raw_frame.path,
+            width=width,
+            height=height,
+            fl_x=fx,
+            fl_y=fy,
+            cx=cx,
+            cy=cy,
+            c2w=c2w,
+        )
+        frame_records.append(record)
+
+        points, colors = sample_points_from_depth(
+            record, depth_map, samples_per_frame, rng
+        )
+        if points.size:
+            sampled_points.append(points)
+            sampled_colors.append(colors)
+
+    if sampled_points:
+        all_points = np.concatenate(sampled_points, axis=0)
+        all_colors = np.concatenate(sampled_colors, axis=0)
+    else:
+        all_points = np.zeros((0, 3), dtype=np.float32)
+        all_colors = np.zeros((0, 3), dtype=np.uint8)
+    return frame_records, all_points, all_colors
+
+
+def sample_points_from_depth(
+    record: FrameRecord,
+    depth_map: np.ndarray,
+    sample_quota: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    depth_img = Image.fromarray(depth_map.astype(np.float32), mode="F")
+    depth_resized = depth_img.resize((record.width, record.height), Image.BILINEAR)
+    depth = np.asarray(depth_resized, dtype=np.float32)
+    valid_mask = depth > 1e-3
+    valid_indices = np.flatnonzero(valid_mask)
+    if valid_indices.size == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+
+    if sample_quota > 0 and valid_indices.size > sample_quota:
+        choice = rng.choice(valid_indices.size, sample_quota, replace=False)
+        flat_idx = valid_indices[choice]
+    else:
+        flat_idx = valid_indices
+
+    ys, xs = np.unravel_index(flat_idx, depth.shape)
+    zs = depth[ys, xs]
+    xs_cam = (xs - record.cx) / record.fl_x * zs
+    ys_cam = (ys - record.cy) / record.fl_y * zs
+    cam_points = np.stack([xs_cam, ys_cam, zs], axis=1)
+    world = (record.c2w[:3, :3] @ cam_points.T + record.c2w[:3, 3:4]).T
+
+    with Image.open(record.image_path) as pil_image:
+        rgb = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+    colors = rgb[ys, xs]
+    return world.astype(np.float32), colors
+
+
 def collect_video_files(root: Path, recursive: bool) -> List[Path]:
     if not root.exists():
         raise FileNotFoundError(f"Video directory {root} not found")
@@ -230,8 +594,12 @@ def harmonize_frame_counts(sequences: Sequence[CameraSequence]) -> int:
             f" target={target}. Counts: {details}"
         )
         for seq in sequences:
-            if len(seq.frames) > target:
-                seq.frames = seq.frames[:target]
+            while len(seq.frames) > target:
+                frame = seq.frames.pop()
+                try:
+                    frame.path.unlink()
+                except FileNotFoundError:
+                    pass
     return target
 
 
@@ -645,6 +1013,60 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of points to keep in the exported point cloud",
     )
     parser.add_argument(
+        "--init_method",
+        choices=("vggt", "megasam"),
+        default="vggt",
+        help="Initializer to use for pose/point estimation",
+    )
+    parser.add_argument(
+        "--megasam_root",
+        type=Path,
+        default=Path("../mega-sam"),
+        help="Path to the MegaSaM repository",
+    )
+    parser.add_argument(
+        "--megasam_env",
+        type=str,
+        default="megasam",
+        help="Conda environment name for MegaSaM (empty string -> current env)",
+    )
+    parser.add_argument(
+        "--megasam_depth_anything_ckpt",
+        type=Path,
+        default=Path("Depth-Anything/checkpoints/depth_anything_vitl14.pth"),
+        help="DepthAnything checkpoint path relative to MegaSaM root unless absolute",
+    )
+    parser.add_argument(
+        "--megasam_tracking_weights",
+        type=Path,
+        default=Path("checkpoints/megasam_final.pth"),
+        help="Camera tracking weights path (relative to MegaSaM root unless absolute)",
+    )
+    parser.add_argument(
+        "--megasam_raft_ckpt",
+        type=Path,
+        default=Path("cvd_opt/raft-things.pth"),
+        help="RAFT checkpoint path (relative to MegaSaM root unless absolute)",
+    )
+    parser.add_argument(
+        "--megasam_da_encoder",
+        type=str,
+        default="vitl",
+        help="DepthAnything encoder variant (vits/vitb/vitl)",
+    )
+    parser.add_argument(
+        "--megasam_reference_camera",
+        type=str,
+        default=None,
+        help="Camera name to run MegaSaM on (default: first camera)",
+    )
+    parser.add_argument(
+        "--megasam_point_oversample",
+        type=float,
+        default=2.0,
+        help="Oversample factor before downsampling MegaSaM point clouds",
+    )
+    parser.add_argument(
         "--vggt_script",
         type=Path,
         default=Path("~/repos/vggt/demo_colmap.py"),
@@ -766,6 +1188,35 @@ def main() -> int:
         frame_count = harmonize_frame_counts(sequences)
         print(f"All cameras will use {frame_count} frame(s)")
 
+        reference_sequence: Optional[CameraSequence] = None
+        if args.init_method == "megasam":
+            if not sequences:
+                raise RuntimeError("No cameras available for MegaSaM initialization")
+            if args.megasam_reference_camera:
+                target = args.megasam_reference_camera.strip()
+                reference_sequence = next(
+                    (seq for seq in sequences if seq.name == target), None
+                )
+                if reference_sequence is None:
+                    raise ValueError(
+                        f"Reference camera '{target}' not found. Available: {[seq.name for seq in sequences]}"
+                    )
+            else:
+                def select_by_keyword(keywords: Sequence[str]) -> Optional[CameraSequence]:
+                    for keyword in keywords:
+                        keyword_lower = keyword.lower()
+                        for seq in sequences:
+                            if keyword_lower in seq.name.lower():
+                                return seq
+                    return None
+
+                reference_sequence = select_by_keyword(["wide"])
+                if reference_sequence is None:
+                    reference_sequence = select_by_keyword(["right"])
+                if reference_sequence is None:
+                    reference_sequence = sequences[0]
+            print(f"MegaSaM reference camera: {reference_sequence.name}")
+
         tmp_scene_dir = output_dir / "tmp_vggt"
         if tmp_scene_dir.exists():
             shutil.rmtree(tmp_scene_dir)
@@ -773,7 +1224,9 @@ def main() -> int:
 
         prepare_vggt_scene(sequences, tmp_scene_dir)
 
-        conda_env = args.vggt_conda_env.strip() if args.vggt_conda_env is not None else None
+        conda_env = (
+            args.vggt_conda_env.strip() if args.vggt_conda_env is not None else None
+        )
         if conda_env == "":
             conda_env = None
 
@@ -789,18 +1242,49 @@ def main() -> int:
         )
 
         points, colors, cameras, images_by_name = load_vggt_outputs(tmp_scene_dir)
-        if points.size == 0:
+        if points.size == 0 and args.init_method == "vggt":
             raise RuntimeError("VGGT did not produce any 3D points. Aborting.")
 
+        if not args.keep_tmp:
+            shutil.rmtree(tmp_scene_dir, ignore_errors=True)
+
+        if args.init_method == "megasam":
+            assert reference_sequence is not None
+            cam_to_world, intr_map = collect_vggt_metadata(
+                sequences, images_by_name, cameras
+            )
+            cam_to_ref = compute_cam_to_ref_transforms(
+                cam_to_world, reference_sequence.name
+            )
+            initializer = MegaSamInitializer(args, output_dir)
+            frames, raw_points, raw_colors = build_hybrid_megasam_records(
+                sequences,
+                reference_sequence,
+                initializer,
+                cam_to_ref,
+                intr_map,
+                frame_count,
+                args.max_point_cloud_points,
+                args.megasam_point_oversample,
+            )
+            print(
+                f"Prepared {len(frames)} hybrid MegaSaM frame records across {len(sequences)} cameras"
+            )
+        else:
+            frames = build_frame_records(sequences, cameras, images_by_name)
+            print(
+                f"Prepared {len(frames)} frame records across {len(sequences)} cameras"
+            )
+            raw_points, raw_colors = points, colors
+
         down_points, down_colors = maybe_downsample(
-            points, colors, args.max_point_cloud_points
+            raw_points, raw_colors, args.max_point_cloud_points
         )
         point_cloud_path = output_dir / "points3D_multipleview.ply"
         write_ply(point_cloud_path, down_points, down_colors)
-        print(f"Saved point cloud with {down_points.shape[0]} points -> {point_cloud_path}")
-
-        frames = build_frame_records(sequences, cameras, images_by_name)
-        print(f"Prepared {len(frames)} frame records across {len(sequences)} cameras")
+        print(
+            f"Saved point cloud with {down_points.shape[0]} points -> {point_cloud_path}"
+        )
 
         sparse_dir_train = output_dir / "sparse_train"
         create_reconstruction(frames, sparse_dir_train, down_points, down_colors)
@@ -816,9 +1300,6 @@ def main() -> int:
 
         create_config_file(output_dir, dataset_name, len(sequences), frame_count)
         print(f"Generated training config at {output_dir / 'config.py'}")
-
-        if not args.keep_tmp:
-            shutil.rmtree(tmp_scene_dir, ignore_errors=True)
 
         # Write conversion done sentinel atomically with metadata
         try:

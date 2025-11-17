@@ -796,14 +796,38 @@ def post_training_evaluation(
 
     try:
         from render import render_sets
+        from pathlib import Path
+
+        # Prefer the requested final iteration, but fall back to the latest saved one if missing
+        model_dir = Path(args.model_path)
+        final_ply = model_dir / "point_cloud" / f"iteration_{final_iteration}" / "point_cloud.ply"
+        chosen_iteration = final_iteration
+        if not final_ply.exists():
+            # Find latest saved iteration
+            iters = []
+            pc_dir = model_dir / "point_cloud"
+            if pc_dir.exists():
+                for d in pc_dir.iterdir():
+                    name = d.name
+                    if name.startswith("iteration_") and (d / "point_cloud.ply").exists():
+                        try:
+                            iters.append(int(name.split("_")[-1]))
+                        except Exception:
+                            pass
+            if iters:
+                chosen_iteration = max(iters)
+                print(
+                    f"[WARN] Requested final iteration {final_iteration} not found; "
+                    f"falling back to latest saved iteration {chosen_iteration}"
+                )
 
         print(
-            f"\nPost-training rendering for iteration {final_iteration} at {args.model_path}"
+            f"\nPost-training rendering for iteration {chosen_iteration} at {args.model_path}"
         )
         render_sets(
             dataset_params,
             hyper_params,
-            final_iteration,
+            chosen_iteration,
             pipeline_params,
             skip_train=not args.post_render_train,
             skip_test=args.post_render_skip_test,
@@ -924,8 +948,6 @@ if __name__ == "__main__":
     # Note: --match_string is automatically added by ModelParams class
 
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
-
     # Auto-detect config.py in source directory if --configs not provided
     if not args.configs:
         from pathlib import Path
@@ -938,6 +960,14 @@ if __name__ == "__main__":
         config = load_config(args.configs)
         args = merge_hparams(args, config)
     args = apply_filtered_training_overrides(args)
+    # Ensure the final iteration checkpoint is saved after configs and overrides
+    try:
+        if getattr(args, "save_iterations", None) is None:
+            args.save_iterations = []
+        if args.iterations not in args.save_iterations:
+            args.save_iterations.append(args.iterations)
+    except Exception:
+        pass
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

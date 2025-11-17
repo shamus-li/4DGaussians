@@ -9,6 +9,14 @@ def _snap_iteration(value: int, base: int = 1000) -> int:
     return max(base, rounded)
 
 
+PHASE2_MIN_COARSE = 5_000
+PHASE2_MIN_TOTAL = 24_000
+PHASE2_MIN_PERCENT_DENSE = 0.045
+PHASE2_MIN_OPACITY = 0.002
+PHASE2_DENSIFY_DELAY = 2_500
+PHASE2_PRUNE_MIN_POINTS = 120_000
+
+
 def generate_multiview_config(
     camera_count: int,
     frame_count: int,
@@ -38,22 +46,21 @@ def generate_multiview_config(
     # Default: allow densification and pruning from iteration 500
     densify_from_iter = 500
     pruning_from_iter = 500
+    few_camera = cameras <= 3
 
     if is_special:
-        if cameras <= 3:
-            iterations = 24_000
-            coarse_iterations = 4_000
-            densify_until = max(densify_until, iterations - 500)
-            percent_dense = 0.04
-            pruning_interval = 100
-            max_screen_size = 25
-            # CRITICAL: Very conservative thresholds for few-camera scenarios to prevent collapse
-            prune_min_points = 100_000  # Effectively disable explicit pruning
-            opacity_threshold = 0.002   # More conservative than 0.0035
-            opacity_reset_interval = 2000  # Enable periodic recovery
-            # Disable densification initially - let initialization stabilize first
-            densify_from_iter = 2000  # Delay densification significantly
-            pruning_from_iter = iterations + 1  # Disable explicit pruning entirely
+        if few_camera:
+            iterations = max(iterations, PHASE2_MIN_TOTAL)
+            coarse_iterations = max(coarse_iterations, PHASE2_MIN_COARSE)
+            densify_until = max(densify_until, iterations - 400)
+            percent_dense = max(percent_dense, PHASE2_MIN_PERCENT_DENSE)
+            pruning_interval = 200
+            max_screen_size = 26
+            prune_min_points = max(prune_min_points, PHASE2_PRUNE_MIN_POINTS)
+            opacity_threshold = min(opacity_threshold, PHASE2_MIN_OPACITY)
+            opacity_reset_interval = max(opacity_reset_interval, 2_000)
+            densify_from_iter = max(densify_from_iter, coarse_iterations + PHASE2_DENSIFY_DELAY)
+            pruning_from_iter = max(pruning_from_iter, iterations + 1)
         elif cameras <= 6:
             iterations = max(iterations, 20_000)
             coarse_iterations = max(coarse_iterations, 3_800)
@@ -87,16 +94,18 @@ def generate_multiview_config(
             max_screen_size = min(max_screen_size, 20)
             prune_min_points = min(prune_min_points, 30_000)
     else:
-        if cameras <= 3:
-            iterations = max(iterations, 21_000)
-            coarse_iterations = max(coarse_iterations, 3_800)
-            densify_until = max(densify_until, iterations - 800)
-            percent_dense = max(percent_dense, 0.036)
-            pruning_interval = 100
-            max_screen_size = 22
-            prune_min_points = 15_000
-            opacity_threshold = max(opacity_threshold, 0.0028)
-            opacity_reset_interval = 0
+        if few_camera:
+            iterations = max(iterations, PHASE2_MIN_TOTAL)
+            coarse_iterations = max(coarse_iterations, PHASE2_MIN_COARSE)
+            densify_until = max(densify_until, iterations - 600)
+            percent_dense = max(percent_dense, PHASE2_MIN_PERCENT_DENSE)
+            pruning_interval = 200
+            max_screen_size = 24
+            prune_min_points = max(prune_min_points, PHASE2_PRUNE_MIN_POINTS // 2)
+            opacity_threshold = min(opacity_threshold, PHASE2_MIN_OPACITY)
+            opacity_reset_interval = max(opacity_reset_interval, 2_000)
+            densify_from_iter = max(densify_from_iter, coarse_iterations + PHASE2_DENSIFY_DELAY)
+            pruning_from_iter = max(pruning_from_iter, iterations + 1)
         elif cameras <= 6:
             iterations = max(iterations, 19_000)
             densify_until = max(densify_until, iterations - 1_200)
