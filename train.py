@@ -888,17 +888,10 @@ def apply_filtered_training_overrides(args):
     args.random_background = False
     args.random_background_coarse_only = True
 
-    # Give the coarse stage more room to converge and extend total iterations for the tougher setting.
-    args.coarse_iterations = max(getattr(args, "coarse_iterations", 0), 6000)
-    args.iterations = max(getattr(args, "iterations", 0), 28_000)
-
     print(f"[FILTERED TRAINING] Applied stability overrides:")
     print(f"  - min_gaussians: {args.min_gaussians}")
     print(f"  - pruning_from_iter: {args.pruning_from_iter}")
     print(f"  - densify_from_iter: {args.densify_from_iter}")
-    print(f"  - coarse_iterations: {args.coarse_iterations}")
-    print(f"  - iterations: {args.iterations}")
-
     return args
 
 if __name__ == "__main__":
